@@ -1,0 +1,116 @@
+/* Page padding/container */
+.page {
+  padding: 1rem;
+}
+@media (min-width: 640px) {
+  .page { padding: 1.5rem; }
+}
+
+/* Header rows: stack on mobile */
+.header-row {
+  display: flex;
+  flex-direction: column;
+  gap: .75rem;
+}
+@media (min-width: 640px) {
+  .header-row {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+  }
+}
+
+/* Header actions: stack on mobile, inline on desktop */
+.header-actions {
+  display: flex;
+  flex-direction: column;
+  gap: .5rem;
+}
+@media (min-width: 640px) {
+  .header-actions {
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+}
+
+/* Button groups: distribute width on mobile */
+.header-actions > * {
+  flex: 1;
+}
+@media (min-width: 640px) {
+  .header-actions > * {
+    flex: none;
+  }
+}
+
+/* Make primary buttons full-width on mobile by opt-in */
+[data-mobile-full="true"] {
+  width: 100%;
+}
+@media (min-width: 640px) {
+  [data-mobile-full="true"] {
+    width: auto;
+  }
+}
+
+/* Tables: scroll container; denser on mobile */
+.table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  border-radius: .75rem;
+  border: 1px solid #e5e7eb; /* gray-200 */
+  background: #fff;
+}
+.table-wrap table {
+  min-width: 640px; /* allow columns to breathe */
+}
+
+/* Forms: make inputs expand on small screens */
+.form-grid {
+  display: grid;
+  gap: .75rem;
+}
+@media (min-width: 768px) {
+  .form-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 1rem;
+  }
+}
+
+/* Cards: reduce inner padding on xs */
+.card-pad {
+  padding: 1rem;
+}
+@media (min-width: 640px) {
+  .card-pad { padding: 1.25rem; }
+}
+
+/* Images: never overflow */
+img, video {
+  max-width: 100%;
+  height: auto;
+}
+
+/* Responsive text truncation */
+.truncate-mobile {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Minimum width for flex containers with truncation */
+.min-w-0 {
+  min-width: 0;
+}
+
+/* Page layout: responsive padding */
+.page {
+  padding: 1rem;
+}
+@media (min-width: 640px) {
+  .page { 
+    padding: 1.5rem; 
+  }
+}
