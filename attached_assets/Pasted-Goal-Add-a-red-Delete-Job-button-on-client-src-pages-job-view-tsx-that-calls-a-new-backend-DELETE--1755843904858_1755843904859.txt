@@ -1,0 +1,104 @@
+Goal:
+Add a red Delete Job button on client/src/pages/job-view.tsx that calls a new backend DELETE /api/jobs/:id.
+
+Show confirmation dialog.
+
+On success → navigate back to /jobs.
+
+On error → show error message.
+
+1) Backend: extend server/routes/jobs.ts
+
+Add at the bottom:
+
+/* DELETE */
+jobs.delete("/:jobId", requireAuth, requireOrg, async (req, res) => {
+  const { jobId } = req.params;
+  const orgId = (req as any).orgId;
+  if (!isUuid(jobId)) return res.status(400).json({ error: "Invalid jobId" });
+
+  await db.execute(sql`
+    delete from jobs
+    where id=${jobId}::uuid and org_id=${orgId}::uuid
+  `);
+
+  res.json({ ok: true });
+});
+
+2) API wrapper — client/src/lib/api.ts
+
+Extend jobsApi:
+
+export const jobsApi = {
+  getAll: () => api("/api/jobs"),
+  get: (id: string) => api(`/api/jobs/${id}`),
+  create: (body: any) => api("/api/jobs/create", { method: "POST", body: JSON.stringify(body) }),
+  update: (id: string, body: any) => api(`/api/jobs/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  customers: () => api("/api/jobs/customers"),
+  equipment: () => api("/api/jobs/equipment"),
+  delete: (id: string) => api(`/api/jobs/${id}`, { method: "DELETE" }), // NEW
+};
+
+3) Frontend: add Delete button to Job View
+
+File: client/src/pages/job-view.tsx
+
+Add imports:
+
+import { jobsApi } from "@/lib/api";
+import { AlertTriangle, Trash } from "lucide-react";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
+
+
+Inside component state:
+
+const [confirmDelete, setConfirmDelete] = useState(false);
+const [deleting, setDeleting] = useState(false);
+const [errDelete, setErrDelete] = useState<string|null>(null);
+
+
+In the header action row (next to Edit Job), add:
+
+<Button variant="destructive" onClick={() => setConfirmDelete(true)}>
+  <Trash className="h-4 w-4 mr-1" /> Delete
+</Button>
+
+
+At the bottom, add the confirm dialog:
+
+<Dialog open={confirmDelete} onOpenChange={setConfirmDelete}>
+  <DialogContent>
+    <DialogHeader>
+      <DialogTitle className="flex items-center gap-2 text-red-600">
+        <AlertTriangle className="h-5 w-5" />
+        Confirm Delete
+      </DialogTitle>
+    </DialogHeader>
+    <p>Are you sure you want to delete <strong>{job.title}</strong>? This cannot be undone.</p>
+    {errDelete && <div className="text-red-600 text-sm">{errDelete}</div>}
+    <DialogFooter className="mt-4 flex justify-end gap-2">
+      <Button variant="outline" onClick={() => setConfirmDelete(false)}>Cancel</Button>
+      <Button
+        variant="destructive"
+        disabled={deleting}
+        onClick={async () => {
+          setDeleting(true);
+          setErrDelete(null);
+          try {
+            await jobsApi.delete(job.id);
+            navigate("/jobs");
+          } catch (e:any) {
+            setErrDelete(e.message || "Failed to delete");
+          } finally {
+            setDeleting(false);
+          }
+        }}
+      >
+        {deleting ? "Deleting…" : "Delete"}
+      </Button>
+    </DialogFooter>
+  </DialogContent>
+</Dialog>
+
+
+✅ With this, every job card gets its own Delete Job option. You’ll be able to safely purge test data or old jobs without dropping tables manually.

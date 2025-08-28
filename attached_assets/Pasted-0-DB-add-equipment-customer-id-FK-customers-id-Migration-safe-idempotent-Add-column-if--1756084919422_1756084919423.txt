@@ -1,0 +1,220 @@
+0) DB: add equipment.customer_id FK → customers(id)
+
+Migration (safe/idempotent):
+
+-- Add column if missing
+ALTER TABLE equipment
+  ADD COLUMN IF NOT EXISTS customer_id uuid;
+
+-- Backfill (optional): if you can map existing equipment to a customer, do it here.
+-- Example placeholder: leave NULL to avoid FK issues.
+-- UPDATE equipment SET customer_id = <some-customer-uuid> WHERE customer_id IS NULL AND name ILIKE '%ABC%';
+
+-- Make sure any bad values are nulled so FK add won't fail
+UPDATE equipment e
+SET customer_id = NULL
+WHERE customer_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM customers c WHERE c.id = e.customer_id);
+
+-- Create the FK (not valid first to avoid legacy scan), then validate
+ALTER TABLE equipment
+  DROP CONSTRAINT IF EXISTS equipment_customer_id_fkey;
+
+ALTER TABLE equipment
+  ADD CONSTRAINT equipment_customer_id_fkey
+  FOREIGN KEY (customer_id) REFERENCES customers(id)
+  ON UPDATE CASCADE ON DELETE SET NULL
+  NOT VALID;
+
+-- Optional: index for fast filtering
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'equipment_customer_idx') THEN
+    CREATE INDEX equipment_customer_idx ON equipment(customer_id);
+  END IF;
+END $$;
+
+-- Validate when ready (can be later/off-hours)
+ALTER TABLE equipment VALIDATE CONSTRAINT equipment_customer_id_fkey;
+
+
+If you want to require a customer for every piece of equipment, do that later with ALTER TABLE equipment ALTER COLUMN customer_id SET NOT NULL; after you’ve backfilled.
+
+1) API: filter equipment by customer for Jobs
+1a) Jobs equipment dropdown endpoint
+
+Edit: server/routes/jobs.ts
+
+// GET /api/jobs/equipment?customerId=uuid
+jobs.get("/equipment", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  const customerId = (req.query.customerId as string | undefined) || undefined;
+
+  const r: any = await db.execute(sql`
+    select id, name
+    from equipment
+    where org_id=${orgId}::uuid
+      ${customerId ? sql`and customer_id=${customerId}::uuid` : sql``}
+    order by name asc
+  `);
+  res.json(r.rows);
+});
+
+1b) (Optional but recommended) validate on assignment
+
+Still in server/routes/jobs.ts, ensure assigned equipment belongs to the same customer as the job:
+
+jobs.post("/:jobId/assign/equipment", requireAuth, requireOrg, async (req, res) => {
+  const { jobId } = req.params; const { equipmentId } = req.body || {};
+  if (!equipmentId) return res.status(400).json({ error: "equipmentId required" });
+
+  // Validate same org & same customer (or job has NULL customer)
+  const chk: any = await db.execute(sql`
+    select
+      j.customer_id as job_customer_id,
+      e.customer_id as eq_customer_id
+    from jobs j
+    join equipment e on e.id=${equipmentId}::uuid and e.org_id=j.org_id
+    where j.id=${jobId}::uuid
+    limit 1
+  `);
+
+  const row = chk.rows?.[0];
+  if (!row) return res.status(400).json({ error: "Job/equipment not found in this org" });
+
+  if (row.job_customer_id && row.eq_customer_id && row.job_customer_id !== row.eq_customer_id) {
+    return res.status(400).json({ error: "Equipment belongs to a different customer" });
+  }
+
+  await db.execute(sql`
+    insert into job_equipment (job_id, equipment_id)
+    values (${jobId}::uuid, ${equipmentId}::uuid)
+    on conflict do nothing;
+  `);
+  res.json({ ok: true });
+});
+
+2) API: allow creating/updating equipment with customer
+
+Edit: server/routes/equipment.ts
+
+// CREATE
+equipment.post("/", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  const { name, make, model, serial, customerId, notes } = req.body || {};
+  if (!name) return res.status(400).json({ error: "name required" });
+
+  const r: any = await db.execute(sql`
+    insert into equipment (org_id, name, make, model, serial, customer_id, notes)
+    values (${orgId}::uuid, ${name}, ${make||null}, ${model||null}, ${serial||null},
+            ${customerId||null}::uuid, ${notes||null})
+    returning id
+  `);
+  res.json({ ok: true, id: r.rows[0].id });
+});
+
+// UPDATE
+equipment.put("/:id", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  const { id } = req.params;
+  const { name, make, model, serial, customerId, notes } = req.body || {};
+
+  await db.execute(sql`
+    update equipment
+       set name = coalesce(${name}, name),
+           make = coalesce(${make}, make),
+           model = coalesce(${model}, model),
+           serial = coalesce(${serial}, serial),
+           customer_id = coalesce(${customerId}::uuid, customer_id),
+           notes = coalesce(${notes}, notes)
+     where id=${id}::uuid and org_id=${orgId}::uuid
+  `);
+  res.json({ ok: true });
+});
+
+3) Client: fetch equipment filtered by selected customer
+3a) API helper
+
+Edit: client/src/lib/api.ts
+
+export const jobsApi = {
+  // ...
+  equipment: (customerId?: string) =>
+    api(`/api/jobs/equipment${customerId ? `?customerId=${encodeURIComponent(customerId)}` : ""}`),
+};
+
+export const equipmentApi = {
+  // unchanged, plus customerId field in create/update payloads
+  create: (body: any) => api("/api/equipment", { method: "POST", body: JSON.stringify(body) }),
+  update: (id: string, body: any) => api(`/api/equipment/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+};
+
+3b) New Job modal/page: re-fetch equipment when customer changes
+
+Edit: client New Job component (where you already load customers):
+
+const [customerId, setCustomerId] = useState<string>("");
+const [equipment, setEquipment] = useState<any[]>([]);
+const [equipmentId, setEquipmentId] = useState<string>(""); // if you allow selecting a single item
+
+useEffect(() => {
+  // reset equipment when customer changes
+  setEquipmentId("");
+  (async () => {
+    const list = await jobsApi.equipment(customerId || undefined);
+    setEquipment(list || []);
+  })();
+}, [customerId]);
+
+
+In the form UI:
+
+{/* Customer select (unchanged) */}
+<select className="w-full border rounded p-2" value={customerId} onChange={(e)=>setCustomerId(e.target.value)}>
+  <option value="">— Select customer —</option>
+  {customers.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+</select>
+
+{/* Equipment select filtered by that customer */}
+<select
+  className="w-full border rounded p-2 mt-3"
+  value={equipmentId}
+  onChange={(e)=>setEquipmentId(e.target.value)}
+  disabled={!customerId}
+>
+  <option value="">{customerId ? "— Select equipment —" : "Select a customer first"}</option>
+  {equipment.map(eq => <option key={eq.id} value={eq.id}>{eq.name}</option>)}
+</select>
+
+
+On create:
+
+await jobsApi.create({
+  title,
+  description,
+  customerId: customerId || null,
+  scheduledAt: isoFromLocalInput(scheduledAt),
+  assignedTechIds,
+  // if you want to auto-link equipment on create:
+  equipmentId: equipmentId || null,
+});
+
+3c) If you want to auto-attach equipment during job creation
+
+Add a tiny block in POST /api/jobs/create to insert into job_equipment when equipmentId is sent:
+
+const { equipmentId } = req.body || {};
+if (equipmentId) {
+  await db.execute(sql`
+    insert into job_equipment (job_id, equipment_id)
+    values (${jobId}::uuid, ${equipmentId}::uuid)
+    on conflict do nothing
+  `);
+}
+
+
+This respects the validation we added earlier if you enforce the same-customer rule there.
+
+4) Equipment Create/Edit form: require/select a customer
+
+In your equipment modal/page, add a Customer dropdown that calls /api/jobs/customers (you’ve already got that) and posts customerId with the equipment create/update.

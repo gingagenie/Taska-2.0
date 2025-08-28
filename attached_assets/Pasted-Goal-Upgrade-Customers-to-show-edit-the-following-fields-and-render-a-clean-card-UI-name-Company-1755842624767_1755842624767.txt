@@ -1,0 +1,405 @@
+Goal:
+Upgrade Customers to show/edit the following fields and render a clean card UI:
+
+name (Company name)
+
+contact_name (Primary contact)
+
+email
+
+phone
+
+street
+
+suburb
+
+state
+
+postcode
+
+(Optional later: country)
+
+Acceptance criteria:
+
+Customers list shows a grid/table of customer “cards,” each showing the fields above (with a single line address street, suburb, state, postcode).
+
+“New Customer” button opens a modal to create with validation (company name required; email format; postcode numeric).
+
+Clicking a customer opens a Customer View page with an Edit button (modal or page).
+
+API endpoints work with auth/tenancy headers and return the new fields.
+
+The Jobs “Customer” dropdown still loads from /api/jobs/customers and uses id + name.
+
+0) DB: ensure columns exist (Neon)
+
+If these columns don’t exist yet on customers, add them:
+
+alter table customers
+  add column if not exists contact_name text,
+  add column if not exists email text,
+  add column if not exists phone text,
+  add column if not exists street text,
+  add column if not exists suburb text,
+  add column if not exists state text,
+  add column if not exists postcode text;
+
+
+(If you’re using Drizzle, add matching fields to the schema file; otherwise this SQL is fine.)
+
+1) Backend — server/routes/customers.ts
+
+Create or update the router so it supports list, get, create, update:
+
+import { Router } from "express";
+import { db } from "../db/client";
+import { sql } from "drizzle-orm";
+import { requireAuth } from "../middleware/auth";
+import { requireOrg } from "../middleware/tenancy";
+
+export const customers = Router();
+const isUuid = (v?: string) => !!v && /^[0-9a-f-]{36}$/i.test(v);
+
+/* LIST */
+customers.get("/", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  const r: any = await db.execute(sql`
+    select id, name, contact_name, email, phone, street, suburb, state, postcode
+    from customers
+    where org_id=${orgId}::uuid
+    order by name asc
+  `);
+  res.json(r.rows);
+});
+
+/* GET ONE */
+customers.get("/:id", requireAuth, requireOrg, async (req, res) => {
+  const { id } = req.params;
+  const orgId = (req as any).orgId;
+  if (!isUuid(id)) return res.status(400).json({ error: "invalid id" });
+  const r: any = await db.execute(sql`
+    select id, name, contact_name, email, phone, street, suburb, state, postcode
+    from customers
+    where id=${id}::uuid and org_id=${orgId}::uuid
+  `);
+  const row = r.rows?.[0];
+  if (!row) return res.status(404).json({ error: "not found" });
+  res.json(row);
+});
+
+/* CREATE */
+customers.post("/", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  const { name, contact_name, email, phone, street, suburb, state, postcode } = req.body || {};
+  if (!name?.trim()) return res.status(400).json({ error: "name required" });
+
+  const r: any = await db.execute(sql`
+    insert into customers (org_id, name, contact_name, email, phone, street, suburb, state, postcode)
+    values (
+      ${orgId}::uuid, ${name}, ${contact_name||null}, ${email||null}, ${phone||null},
+      ${street||null}, ${suburb||null}, ${state||null}, ${postcode||null}
+    )
+    returning id
+  `);
+  res.json({ ok: true, id: r.rows[0].id });
+});
+
+/* UPDATE */
+customers.put("/:id", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  const { id } = req.params;
+  if (!isUuid(id)) return res.status(400).json({ error: "invalid id" });
+
+  const { name, contact_name, email, phone, street, suburb, state, postcode } = req.body || {};
+  await db.execute(sql`
+    update customers set
+      name         = coalesce(${name}, name),
+      contact_name = coalesce(${contact_name}, contact_name),
+      email        = coalesce(${email}, email),
+      phone        = coalesce(${phone}, phone),
+      street       = coalesce(${street}, street),
+      suburb       = coalesce(${suburb}, suburb),
+      state        = coalesce(${state}, state),
+      postcode     = coalesce(${postcode}, postcode)
+    where id=${id}::uuid and org_id=${orgId}::uuid
+  `);
+  res.json({ ok: true });
+});
+
+export { customers as default };
+
+
+Mount it in your routes registry (e.g., server/routes.ts):
+
+import { customers } from "./routes/customers";
+app.use("/api/customers", customers);
+console.log("[mount] /api/customers");
+
+
+Keep /api/jobs/customers (id + name) endpoint as-is for job dropdowns.
+
+2) Frontend API — client/src/lib/api.ts
+
+Ensure customers wrappers cover the new fields:
+
+export const customersApi = {
+  getAll: () => api("/api/customers"),
+  get: (id: string) => api(`/api/customers/${id}`),
+  create: (body: any) => api("/api/customers", { method: "POST", body: JSON.stringify(body) }),
+  update: (id: string, body: any) => api(`/api/customers/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+};
+
+3) Customers List — client/src/pages/customers.tsx
+
+Implement a grid/table of customer “cards”, plus New button:
+
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { customersApi } from "@/lib/api";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Link, useLocation } from "wouter";
+import { useState } from "react";
+import { CustomerModal } from "@/components/modals/customer-modal";
+
+export default function Customers() {
+  const { data: list = [], isLoading } = useQuery({ queryKey: ["/api/customers"], queryFn: customersApi.getAll });
+  const [q, setQ] = useState("");
+  const [open, setOpen] = useState(false);
+  const filtered = list.filter((c:any) => (c.name||"").toLowerCase().includes(q.toLowerCase()));
+
+  return (
+    <div className="p-6 space-y-4">
+      <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-bold">Customers</h1>
+        <div className="flex gap-2">
+          <Input placeholder="Search by company…" value={q} onChange={(e)=>setQ(e.target.value)} className="w-64" />
+          <Button onClick={()=>setOpen(true)}>New Customer</Button>
+        </div>
+      </div>
+
+      {isLoading ? (
+        <Card><CardContent>Loading…</CardContent></Card>
+      ) : filtered.length === 0 ? (
+        <Card><CardContent>No customers yet</CardContent></Card>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+          {filtered.map((c:any) => (
+            <Link key={c.id} href={`/customers/${c.id}`}>
+              <a>
+                <Card className="hover:shadow cursor-pointer">
+                  <CardHeader><CardTitle>{c.name}</CardTitle></CardHeader>
+                  <CardContent className="text-sm space-y-1">
+                    {c.contact_name && <div><span className="text-gray-500">Contact:</span> {c.contact_name}</div>}
+                    {c.email && <div><span className="text-gray-500">Email:</span> {c.email}</div>}
+                    {c.phone && <div><span className="text-gray-500">Phone:</span> {c.phone}</div>}
+                    <div className="text-gray-500">Address:</div>
+                    <div>
+                      {[c.street, c.suburb, c.state, c.postcode].filter(Boolean).join(", ") || "—"}
+                    </div>
+                  </CardContent>
+                </Card>
+              </a>
+            </Link>
+          ))}
+        </div>
+      )}
+
+      <CustomerModal open={open} onOpenChange={setOpen} />
+    </div>
+  );
+}
+
+4) Customer View — client/src/pages/customer-view.tsx
+
+A simple details page with an Edit button:
+
+import { useEffect, useState } from "react";
+import { useRoute, Link } from "wouter";
+import { customersApi } from "@/lib/api";
+import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { CustomerModal } from "@/components/modals/customer-modal";
+
+export default function CustomerView() {
+  const [match, params] = useRoute("/customers/:id");
+  const id = params?.id as string;
+  const [c, setC] = useState<any>(null);
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => { customersApi.get(id).then(setC); }, [id]);
+  if (!c) return <div className="p-6">Loading…</div>;
+
+  return (
+    <div className="p-6 space-y-4">
+      <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-bold">{c.name}</h1>
+        <div className="flex gap-2">
+          <Link href="/customers"><a><Button variant="outline">Back</Button></a></Link>
+          <Button onClick={()=>setOpen(true)}>Edit</Button>
+        </div>
+      </div>
+
+      <Card>
+        <CardHeader><CardTitle>Company</CardTitle></CardHeader>
+        <CardContent className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+          <div><div className="text-gray-500">Contact</div><div>{c.contact_name || "—"}</div></div>
+          <div><div className="text-gray-500">Phone</div><div>{c.phone || "—"}</div></div>
+          <div><div className="text-gray-500">Email</div><div>{c.email || "—"}</div></div>
+          <div className="md:col-span-2">
+            <div className="text-gray-500">Address</div>
+            <div>{[c.street, c.suburb, c.state, c.postcode].filter(Boolean).join(", ") || "—"}</div>
+          </div>
+        </CardContent>
+      </Card>
+
+      <CustomerModal open={open} onOpenChange={setOpen} customer={c} onSaved={(updated)=>setC(updated)} />
+    </div>
+  );
+}
+
+
+Register the route in your app router:
+
+<Route path="/customers/:id" component={CustomerView} />
+
+5) Customer Modal — client/src/components/modals/customer-modal.tsx
+
+Create a reusable modal for create + edit:
+
+import { useEffect, useState } from "react";
+import { customersApi } from "@/lib/api";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Label } from "@/components/ui/label";
+import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
+
+type Props = {
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  customer?: any; // if present -> edit mode
+  onSaved?: (c:any)=>void;
+};
+
+export function CustomerModal({ open, onOpenChange, customer, onSaved }: Props) {
+  const isEdit = !!customer;
+  const [name, setName] = useState("");
+  const [contact_name, setContactName] = useState("");
+  const [email, setEmail] = useState("");
+  const [phone, setPhone] = useState("");
+  const [street, setStreet] = useState("");
+  const [suburb, setSuburb] = useState("");
+  const [state, setState] = useState("");
+  const [postcode, setPostcode] = useState("");
+  const [err, setErr] = useState<string|null>(null);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (open && isEdit) {
+      setName(customer.name || "");
+      setContactName(customer.contact_name || "");
+      setEmail(customer.email || "");
+      setPhone(customer.phone || "");
+      setStreet(customer.street || "");
+      setSuburb(customer.suburb || "");
+      setState(customer.state || "");
+      setPostcode(customer.postcode || "");
+    }
+    if (open && !isEdit) {
+      setName(""); setContactName(""); setEmail(""); setPhone("");
+      setStreet(""); setSuburb(""); setState(""); setPostcode("");
+      setErr(null);
+    }
+  }, [open, isEdit, customer]);
+
+  async function save() {
+    if (!name.trim()) { setErr("Company name is required"); return; }
+    if (email && !/^\S+@\S+\.\S+$/.test(email)) { setErr("Enter a valid email"); return; }
+    setSaving(true); setErr(null);
+    try {
+      if (isEdit) {
+        await customersApi.update(customer.id, { name, contact_name, email, phone, street, suburb, state, postcode });
+        onSaved?.({ ...customer, name, contact_name, email, phone, street, suburb, state, postcode });
+      } else {
+        await customersApi.create({ name, contact_name, email, phone, street, suburb, state, postcode });
+      }
+      onOpenChange(false);
+    } catch (e:any) {
+      setErr(e?.message || "Failed to save");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-xl">
+        <DialogHeader>
+          <DialogTitle>{isEdit ? "Edit Customer" : "New Customer"}</DialogTitle>
+        </DialogHeader>
+
+        {err && <div className="text-red-600 text-sm">{err}</div>}
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div className="md:col-span-2">
+            <Label>Company name</Label>
+            <Input value={name} onChange={(e)=>setName(e.target.value)} placeholder="e.g., ABC Manufacturing" />
+          </div>
+
+          <div>
+            <Label>Contact name</Label>
+            <Input value={contact_name} onChange={(e)=>setContactName(e.target.value)} />
+          </div>
+          <div>
+            <Label>Phone</Label>
+            <Input value={phone} onChange={(e)=>setPhone(e.target.value)} />
+          </div>
+          <div className="md:col-span-2">
+            <Label>Email</Label>
+            <Input type="email" value={email} onChange={(e)=>setEmail(e.target.value)} />
+          </div>
+
+          <div className="md:col-span-2">
+            <Label>Street</Label>
+            <Input value={street} onChange={(e)=>setStreet(e.target.value)} placeholder="123 Example St" />
+          </div>
+          <div>
+            <Label>Suburb</Label>
+            <Input value={suburb} onChange={(e)=>setSuburb(e.target.value)} placeholder="Richmond" />
+          </div>
+          <div>
+            <Label>State</Label>
+            <Input value={state} onChange={(e)=>setState(e.target.value)} placeholder="VIC" />
+          </div>
+          <div>
+            <Label>Postcode</Label>
+            <Input value={postcode} onChange={(e)=>setPostcode(e.target.value)} placeholder="3000" />
+          </div>
+        </div>
+
+        <div className="pt-3 flex justify-end gap-2">
+          <Button variant="outline" onClick={()=>onOpenChange(false)} disabled={saving}>Cancel</Button>
+          <Button onClick={save} disabled={saving}>{saving ? "Saving…" : (isEdit ? "Save changes" : "Create customer")}</Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+
+Add this file and ensure shadcn <Dialog> components are available (you already use them in other modals).
+
+6) Router
+
+Make sure client/src/App.tsx (or your router file) has:
+
+<Route path="/customers" component={Customers} />
+<Route path="/customers/:id" component={CustomerView} />
+
+7) Quick test
+
+Create a new customer with all fields → appears in list with a single-line address.
+
+Click a customer → view page shows all fields and Edit works.
+
+Jobs “Customer” dropdown still lists names (unchanged).

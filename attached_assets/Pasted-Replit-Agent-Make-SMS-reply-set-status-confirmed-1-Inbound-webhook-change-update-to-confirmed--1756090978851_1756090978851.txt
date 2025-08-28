@@ -1,0 +1,86 @@
+Replit Agent — Make SMS reply set status = confirmed
+1) Inbound webhook: change update to confirmed
+
+Edit: server/routes/twilio-webhooks.ts
+(keep the rest as you have it; only the update line changes)
+
+// ...inside the YES/Y block after you resolve jobId
+if (jobId) {
+  await db.execute(sql`
+    update jobs set status='confirmed' where id=${jobId}::uuid
+  `);
+
+  // keep your optional linkage of inbound log to the job
+  await db.execute(sql`
+    update job_notifications
+       set job_id=${jobId}::uuid
+     where provider_id=${req.body.MessageSid || null}
+       and direction='in'
+  `);
+}
+
+
+If you used the earlier version that set scheduled, replace that with confirmed.
+
+2) Outbound logging: normalize phone so matching works
+
+Make sure your send route logs the phone in a normalized format so inbound can match it. In server/routes/job-sms.ts (your send endpoint), add the same normalizer used by inbound:
+
+function normPhone(s?: string | null) {
+  if (!s) return "";
+  const digits = s.replace(/[^\d]/g, "");
+  if (digits.startsWith("04")) return "+61" + digits.slice(1);
+  if (digits.startsWith("61")) return "+" + digits;
+  if (digits.startsWith("0"))  return "+61" + digits.slice(1);
+  return s.startsWith("+") ? s : "+" + digits;
+}
+
+// after you send the SMS:
+const toPhone = normPhone(phoneOverride || row.customer_phone || "");
+await db.execute(sql`
+  insert into job_notifications (org_id, job_id, channel, to_addr, body, provider_id, direction, status)
+  values (${orgId}::uuid, ${row.id}::uuid, 'sms', ${toPhone}, ${body}, ${msg.sid}, 'out', ${msg.status})
+`);
+
+
+(Inbound already normalizes; this makes the join bulletproof.)
+
+3) UI: teach Jobs page about confirmed
+a) Status filter options
+
+Edit: client/src/pages/jobs.tsx (or wherever your list filter lives)
+Add confirmed to the dropdown:
+
+<SelectContent>
+  <SelectItem value="all">All Status</SelectItem>
+  <SelectItem value="new">New</SelectItem>
+  <SelectItem value="scheduled">Scheduled</SelectItem>
+  <SelectItem value="confirmed">Confirmed</SelectItem>
+  <SelectItem value="in_progress">In Progress</SelectItem>
+  <SelectItem value="done">Done</SelectItem>
+  <SelectItem value="cancelled">Cancelled</SelectItem>
+</SelectContent>
+
+b) Badge color mapping
+
+Extend your helper:
+
+const getStatusBadgeClass = (status: string) => {
+  switch (status) {
+    case "new": return "status-badge status-new";
+    case "scheduled": return "status-badge status-scheduled";
+    case "confirmed": return "status-badge status-confirmed"; // add CSS token
+    case "in_progress": return "status-badge status-in-progress";
+    case "done":
+    case "completed": return "status-badge status-completed";
+    case "cancelled": return "status-badge status-cancelled";
+    default: return "status-badge";
+  }
+};
+
+
+Add styles in your CSS (or Tailwind classes if you’re not using custom tokens), e.g. status-confirmed with a pleasant green/amber.
+
+4) (Optional) job view: quick visual cue + manual override
+
+On the Job card header, if status === 'confirmed', show a ✅ chip. Also consider a “Mark unconfirmed” button for manual control (calls PUT /api/jobs/:id with status: 'scheduled').

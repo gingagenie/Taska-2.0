@@ -1,0 +1,267 @@
+Gotcha. Two things to sort:
+
+1. Modal interfering with Android/iOS system bar → make the member modal centered, scrollable, and add safe-area bottom padding so the buttons sit above the nav bar.
+
+
+2. Add Member = actually create login → when you add a member, also create a user in your org with a password (or temp password), so they can log in.
+
+
+
+Below is Replit-agent ready code you can paste.
+
+
+---
+
+1) Fix the member modal layout (centered + safe area)
+
+Edit: client/src/components/modals/member-edit-modal.tsx
+(replace the outer structure + footer)
+
+import { useEffect, useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { api } from "@/lib/api";
+import { useQueryClient } from "@tanstack/react-query";
+
+/** Centered, scrollable modal with safe-area padding so buttons don't clash with OS nav */
+export default function MemberEditModal({
+  member, open, onOpenChange,
+}: { member: any|null; open: boolean; onOpenChange: (v:boolean)=>void }) {
+  const qc = useQueryClient();
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [role, setRole] = useState("technician");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string|null>(null);
+
+  useEffect(() => {
+    if (member) {
+      setName(member.name || "");
+      setEmail(member.email || "");
+      setRole(member.role || "technician");
+    }
+  }, [member]);
+
+  async function save() {
+    if (!member) return;
+    setSaving(true); setErr(null);
+    try {
+      await api(`/api/members/${member.id}`, {
+        method: "PUT",
+        body: JSON.stringify({ name, email, role }),
+      });
+      await qc.invalidateQueries({ queryKey: ["/api/members"] });
+      onOpenChange(false);
+    } catch (e:any) {
+      setErr(e.message || "Failed to save");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (!open || !member) return null;
+
+  return (
+    <div className="fixed inset-0 z-50">
+      {/* dim background + click to close */}
+      <div
+        className="absolute inset-0 bg-black/40"
+        onClick={() => onOpenChange(false)}
+      />
+      {/* centered container */}
+      <div className="absolute inset-0 flex items-center justify-center p-4">
+        <div
+          className="
+            w-[92vw] sm:w-full sm:max-w-md
+            max-h-[85vh] rounded-2xl bg-white shadow-xl
+            flex flex-col
+          "
+          role="dialog"
+          aria-modal="true"
+        >
+          {/* Header */}
+          <div className="px-5 pt-4 pb-3 border-b">
+            <div className="text-lg font-semibold">Edit Member</div>
+          </div>
+
+          {/* Scrollable content */}
+          <div className="flex-1 overflow-y-auto px-5 py-4">
+            {err && <div className="text-sm text-red-600 mb-3">{err}</div>}
+
+            <div className="space-y-3">
+              <div>
+                <label className="text-sm">Name</label>
+                <Input value={name} onChange={(e)=>setName(e.target.value)} />
+              </div>
+              <div>
+                <label className="text-sm">Email</label>
+                <Input type="email" value={email} onChange={(e)=>setEmail(e.target.value)} />
+              </div>
+              <div>
+                <label className="text-sm">Role</label>
+                <Select value={role} onValueChange={setRole}>
+                  <SelectTrigger><SelectValue placeholder="Role" /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="technician">Technician</SelectItem>
+                    <SelectItem value="manager">Manager</SelectItem>
+                    <SelectItem value="admin">Admin</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+
+            {/* spacer so content never hides under footer */}
+            <div className="h-3" />
+          </div>
+
+          {/* Sticky footer with safe-area bottom padding */}
+          <div
+            className="
+              border-t px-5 py-3
+              pb-[max(env(safe-area-inset-bottom),12px)]
+              bg-white rounded-b-2xl
+            "
+          >
+            <div className="flex gap-2">
+              <Button variant="outline" className="flex-1" onClick={()=>onOpenChange(false)}>Cancel</Button>
+              <Button className="flex-1" onClick={save} disabled={saving}>
+                {saving ? "Saving…" : "Save"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+> Key bits:
+
+Centered modal (items-center justify-center) with max-h-[85vh] and overflow-y-auto.
+
+Footer uses pb-[max(env(safe-area-inset-bottom),12px)] so it sits above iOS/Android system bars.
+
+Background is clickable to dismiss.
+
+
+
+
+If you have a separate Add Member modal, apply the same structure there.
+
+
+---
+
+2) “Add Member” should also create login (password)
+
+We’ll add a POST route that creates a user (in your current org) with a password, so they can sign in immediately. We’ll also support “send invite” later—but for now: set a password.
+
+Server
+
+Edit/Create: server/routes/members.ts
+
+import { Router } from "express";
+import { db } from "../db/client";
+import { sql } from "drizzle-orm";
+import { requireAuth } from "../middleware/auth";
+import { requireOrg } from "../middleware/tenancy";
+import bcrypt from "bcryptjs";
+
+export const members = Router();
+
+/** List members in org */
+members.get("/", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  const r: any = await db.execute(sql`
+    select id, name, email, role
+    from users
+    where org_id=${orgId}::uuid
+    order by name asc
+  `);
+  res.json(r.rows);
+});
+
+/** Create member + login (password) */
+members.post("/", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  const { name, email, role = "technician", password } = req.body || {};
+  if (!email || !name) return res.status(400).json({ error: "name and email required" });
+  if (!password || password.length < 6) return res.status(400).json({ error: "password must be at least 6 chars" });
+
+  // unique email inside org
+  const existing: any = await db.execute(sql`
+    select 1 from users where org_id=${orgId}::uuid and lower(email)=lower(${email})
+  `);
+  if (existing.rows?.length) return res.status(409).json({ error: "email already exists in this org" });
+
+  const hash = await bcrypt.hash(password, 10);
+
+  const ins: any = await db.execute(sql`
+    insert into users (org_id, name, email, role, password_hash)
+    values (${orgId}::uuid, ${name}, ${email}, ${role}, ${hash})
+    returning id, name, email, role
+  `);
+
+  res.json({ ok: true, user: ins.rows[0] });
+});
+
+/** Update member (already in your file above) */
+members.put("/:memberId", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  const { memberId } = req.params;
+  const { name, email, role } = req.body || {};
+
+  await db.execute(sql`
+    update users
+      set name = coalesce(${name}, name),
+          email = coalesce(${email}, email),
+          role  = coalesce(${role}, role)
+    where id=${memberId}::uuid and org_id=${orgId}::uuid
+  `);
+  res.json({ ok: true });
+});
+
+Mount (if not already): in server/index.ts
+
+import { members } from "./routes/members";
+app.use("/api/members", members);
+
+> We’re using bcryptjs on the server. If it’s not in your package.json, add it:
+
+"dependencies": { "bcryptjs": "^2.4.3" }
+
+
+
+Client – Add Member (with password)
+
+If you have an Add Member modal, add password fields and call POST /api/members.
+
+Edit: client/src/components/modals/member-add-modal.tsx (example)
+
+import { useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { api } from "@/lib/api";
+import { useQueryClient } from "@tanstack/react-query";
+
+export default function MemberAddModal({ open, onOpenChange }: { open: boolean; onOpenChange: (v:boolean)=>void }) {
+  const qc = useQueryClient();
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [role, setRole] = useState("technician");
+  const [password, setPassword] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string|null>(null);
+
+  async function save() {
+    setSaving(true); setErr(null);
+    try {
+      await api("/api/members", {
+        method: "POST",
+        body: JSON.stringify({ name, email, role, password }),
+      });
+      await qc.invalidateQueries({ queryKey: ["/api/members"] });
+      onOpenChange(false);
+      setName(""); setEmail(""); setPassword(""); setRole("technician");
+

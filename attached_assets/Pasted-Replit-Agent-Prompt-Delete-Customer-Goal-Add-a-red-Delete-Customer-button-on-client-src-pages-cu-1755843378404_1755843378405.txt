@@ -1,0 +1,109 @@
+Replit Agent Prompt — Delete Customer
+
+Goal:
+Add a red Delete Customer button on client/src/pages/customer-view.tsx that calls a new backend DELETE /api/customers/:id.
+
+Show a confirmation dialog before deletion.
+
+On success → navigate back to /customers.
+
+On error → show an error message.
+
+1) Backend: extend server/routes/customers.ts
+
+Add this handler:
+
+/* DELETE */
+customers.delete("/:id", requireAuth, requireOrg, async (req, res) => {
+  const { id } = req.params;
+  const orgId = (req as any).orgId;
+  if (!isUuid(id)) return res.status(400).json({ error: "invalid id" });
+
+  await db.execute(sql`
+    delete from customers
+    where id=${id}::uuid and org_id=${orgId}::uuid
+  `);
+
+  res.json({ ok: true });
+});
+
+2) API wrapper: client/src/lib/api.ts
+
+Extend customersApi:
+
+export const customersApi = {
+  getAll: () => api("/api/customers"),
+  get: (id: string) => api(`/api/customers/${id}`),
+  create: (body: any) => api("/api/customers", { method: "POST", body: JSON.stringify(body) }),
+  update: (id: string, body: any) => api(`/api/customers/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  delete: (id: string) => api(`/api/customers/${id}`, { method: "DELETE" }), // NEW
+};
+
+3) Frontend: add Delete button to Customer View
+
+File: client/src/pages/customer-view.tsx
+
+At the top of imports:
+
+import { AlertTriangle, Trash } from "lucide-react";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
+
+
+Inside the component state:
+
+const [confirmDelete, setConfirmDelete] = useState(false);
+const [deleting, setDeleting] = useState(false);
+const [err, setErr] = useState<string|null>(null);
+
+
+Add a Delete button to the header button row:
+
+<Button variant="destructive" onClick={() => setConfirmDelete(true)}>
+  <Trash className="h-4 w-4 mr-1" /> Delete
+</Button>
+
+
+Then at the bottom, render the confirm dialog:
+
+<Dialog open={confirmDelete} onOpenChange={setConfirmDelete}>
+  <DialogContent>
+    <DialogHeader>
+      <DialogTitle className="flex items-center gap-2 text-red-600">
+        <AlertTriangle className="h-5 w-5" />
+        Confirm Delete
+      </DialogTitle>
+    </DialogHeader>
+    <p>Are you sure you want to delete <strong>{c.name}</strong>? This cannot be undone.</p>
+    {err && <div className="text-red-600 text-sm">{err}</div>}
+    <DialogFooter className="mt-4 flex justify-end gap-2">
+      <Button variant="outline" onClick={() => setConfirmDelete(false)}>Cancel</Button>
+      <Button
+        variant="destructive"
+        disabled={deleting}
+        onClick={async () => {
+          setDeleting(true);
+          setErr(null);
+          try {
+            await customersApi.delete(c.id);
+            navigate("/customers");
+          } catch (e:any) {
+            setErr(e.message || "Failed to delete");
+          } finally {
+            setDeleting(false);
+          }
+        }}
+      >
+        {deleting ? "Deleting…" : "Delete"}
+      </Button>
+    </DialogFooter>
+  </DialogContent>
+</Dialog>
+
+
+✅ Now customers can be deleted safely:
+
+Click Delete → confirm dialog.
+
+If confirmed → hits backend, deletes, and returns to customer list.
+
+If error → shows error in the dialog.

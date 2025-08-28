@@ -1,0 +1,117 @@
+🔧 One-shot Patch (copy/paste to Replit)
+1) Stop sending demo headers by default
+
+Edit client/src/lib/api.ts — only send headers if they’re explicitly set; never default to demo IDs.
+
+// client/src/lib/api.ts
+const BASE = import.meta.env.VITE_API_BASE_URL || "";
+
+function getAuthHeaders() {
+  const uid = localStorage.getItem("x-user-id"); // no default
+  const oid = localStorage.getItem("x-org-id");  // no default
+  const h: Record<string,string> = {};
+  if (uid) h["x-user-id"] = uid;
+  if (oid) h["x-org-id"] = oid;
+  return h;
+}
+
+export async function api(path: string, init: RequestInit = {}) {
+  const headers = {
+    "Content-Type": "application/json",
+    ...getAuthHeaders(),
+    ...(init.headers || {}),
+  };
+  const res = await fetch(`${BASE}${path}`, {
+    ...init,
+    headers,
+    credentials: "include", // keep sessions working
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    try { const j = JSON.parse(text); throw new Error(j.error || j.message || text); }
+    catch { throw new Error(text || `HTTP ${res.status}`); }
+  }
+  return text ? JSON.parse(text) : null;
+}
+
+// Ensure we can clear any old dev overrides
+export function clearDevAuth() {
+  localStorage.removeItem("x-user-id");
+  localStorage.removeItem("x-org-id");
+}
+
+2) Force-clear any lingering dev overrides on auth events
+
+Edit login & register pages right after success:
+
+import { clearDevAuth } from "@/lib/api";
+
+// after successful /api/auth/login or /api/auth/register:
+clearDevAuth();     // 👈 nuke dev headers
+await reload();     // your AuthProvider reloads /api/me
+nav("/");
+
+3) Server: never let headers override session in production
+
+Edit server/middleware/tenancy.ts to prefer the session org, and block mismatches:
+
+import { Request, Response, NextFunction } from "express";
+
+export function requireOrg(req: Request, res: Response, next: NextFunction) {
+  const sessOrg = (req.session as any)?.orgId as string | undefined;
+  const headerOrg = (req.headers["x-org-id"] as string | undefined) || undefined;
+
+  const isProd = process.env.NODE_ENV === "production";
+  // In prod: always use session. In dev: allow header ONLY if no session.
+  const chosen = isProd ? sessOrg : (sessOrg || headerOrg);
+
+  if (!chosen) return res.status(400).json({ error: "No organization selected" });
+
+  // Extra safety: if both present and conflict, reject.
+  if (sessOrg && headerOrg && sessOrg !== headerOrg) {
+    return res.status(400).json({ error: "Org mismatch between session and header" });
+  }
+
+  (req as any).orgId = chosen;
+  next();
+}
+
+
+(This keeps local “x-org-id” handy for testing in dev, but production is session-only.)
+
+4) (Recommended) Add a tiny debug endpoint (remove later)
+
+Helps confirm what the server is actually using.
+
+// server/routes/health.ts
+import { Router } from "express";
+export const health = Router();
+health.get("/whoami", (req, res) => {
+  res.json({
+    env: process.env.NODE_ENV,
+    sessionUserId: (req.session as any)?.userId || null,
+    sessionOrgId: (req.session as any)?.orgId || null,
+    headerUserId: req.headers["x-user-id"] || null,
+    headerOrgId: req.headers["x-org-id"] || null,
+    effectiveOrgId: (req as any).orgId || null, // after requireOrg
+  });
+});
+// mount: app.use("/health", health);
+
+5) Auth provider: make sure selected org comes from session
+
+If you store selectedOrgId in localStorage from the old demo, reset it after reload:
+
+// in AuthProvider after fetching /api/me and (optionally) /api/org
+useEffect(()=>{ (async()=>{
+  const me = await api("/api/me"); 
+  setUser(me);
+  // if you keep selectedOrgId in context:
+  setSelectedOrgId && setSelectedOrgId((prev:any)=>{
+    // in production, always snap to session org
+    return process.env.NODE_ENV === "production" ? me?.org_id : (prev || me?.org_id);
+  });
+})(); }, []);
+
+
+And on logout, also call clearDevAuth().

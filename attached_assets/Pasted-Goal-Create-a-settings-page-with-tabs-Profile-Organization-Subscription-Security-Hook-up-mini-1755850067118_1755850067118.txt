@@ -1,0 +1,329 @@
+Goal:
+Create a /settings page with tabs: Profile, Organization, Subscription, Security.
+Hook up minimal backend routes for reading/updating the current user and org.
+Make the sidebar user footer open /settings.
+
+1) Backend routes
+
+File: server/routes/me.ts (expand it)
+Add these endpoints (adjust field names to your users/org tables if needed):
+
+import { Router } from "express";
+import { db } from "../db/client";
+import { sql } from "drizzle-orm";
+import { requireAuth } from "../middleware/auth";
+import { requireOrg } from "../middleware/tenancy";
+
+export const me = Router();
+
+/** Who am I + my org (read) */
+me.get("/", requireAuth, requireOrg, async (req, res) => {
+  const user = (req as any).user;         // id, email, name, role
+  const orgId = (req as any).orgId;
+
+  const org: any = await db.execute(sql`
+    select id, name, abn, street, suburb, state, postcode, default_labour_rate_cents, plan, plan_renews_at
+    from organizations
+    where id=${orgId}::uuid
+  `);
+
+  res.json({
+    user: {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      role: user.role,
+      phone: user.phone || null,
+      avatar_url: user.avatar_url || null,
+    },
+    org: org.rows?.[0] || null
+  });
+});
+
+/** Update profile */
+me.put("/profile", requireAuth, async (req, res) => {
+  const userId = (req as any).user.id;
+  const { name, role, phone, avatarUrl } = req.body || {};
+  await db.execute(sql`
+    update users set
+      name = coalesce(${name}, name),
+      role = coalesce(${role}, role),
+      phone = coalesce(${phone}, phone),
+      avatar_url = coalesce(${avatarUrl}, avatar_url)
+    where id=${userId}::uuid
+  `);
+  res.json({ ok: true });
+});
+
+/** Change password (very basic stub; replace with real hashing/validation) */
+me.post("/change-password", requireAuth, async (req, res) => {
+  const userId = (req as any).user.id;
+  const { currentPassword, newPassword } = req.body || {};
+  if (!newPassword) return res.status(400).json({ error: "newPassword required" });
+
+  // TODO: verify currentPassword hash
+  await db.execute(sql`
+    update users set password_hash = crypt(${newPassword}, gen_salt('bf'))
+    where id=${userId}::uuid
+  `);
+  res.json({ ok: true });
+});
+
+/** Update organization */
+me.put("/org", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  const { name, abn, street, suburb, state, postcode, defaultLabourRateCents } = req.body || {};
+  await db.execute(sql`
+    update organizations set
+      name = coalesce(${name}, name),
+      abn = coalesce(${abn}, abn),
+      street = coalesce(${street}, street),
+      suburb = coalesce(${suburb}, suburb),
+      state = coalesce(${state}, state),
+      postcode = coalesce(${postcode}, postcode),
+      default_labour_rate_cents = coalesce(${defaultLabourRateCents}, default_labour_rate_cents)
+    where id=${orgId}::uuid
+  `);
+  res.json({ ok: true });
+});
+
+/** Subscription read-only (already included in /me) */
+
+
+If you don’t have organizations.default_labour_rate_cents, add it (int). That’ll feed your billable charges defaults.
+
+Make sure this router is mounted at /api/me (sounds like you already did).
+
+2) Client API wrappers
+
+File: client/src/lib/api.ts
+Add this block:
+
+export const meApi = {
+  get: () => api("/api/me"),
+  updateProfile: (body: any) => api("/api/me/profile", { method: "PUT", body: JSON.stringify(body) }),
+  changePassword: (body: any) => api("/api/me/change-password", { method: "POST", body: JSON.stringify(body) }),
+  updateOrg: (body: any) => api("/api/me/org", { method: "PUT", body: JSON.stringify(body) }),
+};
+
+3) Settings page with tabs
+
+File: client/src/pages/settings.tsx (new)
+
+import { useEffect, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { meApi } from "@/lib/api";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
+
+export default function SettingsPage() {
+  const qc = useQueryClient();
+  const { data, isLoading } = useQuery({ queryKey: ["/api/me"], queryFn: meApi.get });
+
+  const [profile, setProfile] = useState({ name: "", role: "", phone: "", avatar_url: "" });
+  const [org, setOrg] = useState({ name: "", abn: "", street: "", suburb: "", state: "", postcode: "", default_labour_rate_cents: 0 });
+  const [pw, setPw] = useState({ current: "", next: "", confirm: "" });
+
+  useEffect(() => {
+    if (!data) return;
+    const u = data.user || {};
+    const o = data.org || {};
+    setProfile({ name: u.name || "", role: u.role || "", phone: u.phone || "", avatar_url: u.avatar_url || "" });
+    setOrg({
+      name: o.name || "", abn: o.abn || "", street: o.street || "", suburb: o.suburb || "",
+      state: o.state || "", postcode: o.postcode || "", default_labour_rate_cents: o.default_labour_rate_cents || 0
+    });
+  }, [data]);
+
+  async function saveProfile() {
+    await meApi.updateProfile({
+      name: profile.name || null,
+      role: profile.role || null,
+      phone: profile.phone || null,
+      avatarUrl: profile.avatar_url || null
+    });
+    qc.invalidateQueries({ queryKey: ["/api/me"] });
+  }
+  async function changePassword() {
+    if (!pw.next || pw.next !== pw.confirm) {
+      alert("Passwords do not match");
+      return;
+    }
+    await meApi.changePassword({ currentPassword: pw.current || null, newPassword: pw.next });
+    setPw({ current: "", next: "", confirm: "" });
+    alert("Password changed");
+  }
+  async function saveOrg() {
+    await meApi.updateOrg({
+      name: org.name || null,
+      abn: org.abn || null,
+      street: org.street || null,
+      suburb: org.suburb || null,
+      state: org.state || null,
+      postcode: org.postcode || null,
+      defaultLabourRateCents: Number(org.default_labour_rate_cents) || 0
+    });
+    qc.invalidateQueries({ queryKey: ["/api/me"] });
+    alert("Organization updated");
+  }
+
+  if (isLoading) return <div className="p-6">Loading…</div>;
+
+  return (
+    <div className="p-6 space-y-4">
+      <h1 className="text-2xl font-bold">Settings</h1>
+
+      <Tabs defaultValue="profile" className="w-full">
+        <TabsList className="grid grid-cols-4 w-full">
+          <TabsTrigger value="profile">Profile</TabsTrigger>
+          <TabsTrigger value="org">Organization</TabsTrigger>
+          <TabsTrigger value="subscription">Subscription</TabsTrigger>
+          <TabsTrigger value="security">Security</TabsTrigger>
+        </TabsList>
+
+        {/* Profile */}
+        <TabsContent value="profile" className="mt-4">
+          <Card>
+            <CardHeader><CardTitle>Profile</CardTitle></CardHeader>
+            <CardContent className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <Label>Name</Label>
+                <Input value={profile.name} onChange={(e)=>setProfile(p=>({...p, name: e.target.value}))} />
+              </div>
+              <div>
+                <Label>Role / Title</Label>
+                <Input value={profile.role} onChange={(e)=>setProfile(p=>({...p, role: e.target.value}))} />
+              </div>
+              <div>
+                <Label>Phone</Label>
+                <Input value={profile.phone} onChange={(e)=>setProfile(p=>({...p, phone: e.target.value}))} />
+              </div>
+              <div>
+                <Label>Avatar URL</Label>
+                <Input value={profile.avatar_url} onChange={(e)=>setProfile(p=>({...p, avatar_url: e.target.value}))} placeholder="Paste image URL (upload coming later)" />
+              </div>
+              <div className="md:col-span-2 flex justify-end">
+                <Button onClick={saveProfile}>Save Profile</Button>
+              </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        {/* Organization */}
+        <TabsContent value="org" className="mt-4">
+          <Card>
+            <CardHeader><CardTitle>Organization</CardTitle></CardHeader>
+            <CardContent className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <Label>Company name</Label>
+                <Input value={org.name} onChange={(e)=>setOrg(o=>({...o, name: e.target.value}))} />
+              </div>
+              <div>
+                <Label>ABN / Company No</Label>
+                <Input value={org.abn} onChange={(e)=>setOrg(o=>({...o, abn: e.target.value}))} />
+              </div>
+              <div>
+                <Label>Street</Label>
+                <Input value={org.street} onChange={(e)=>setOrg(o=>({...o, street: e.target.value}))} />
+              </div>
+              <div>
+                <Label>Suburb</Label>
+                <Input value={org.suburb} onChange={(e)=>setOrg(o=>({...o, suburb: e.target.value}))} />
+              </div>
+              <div>
+                <Label>State</Label>
+                <Input value={org.state} onChange={(e)=>setOrg(o=>({...o, state: e.target.value}))} />
+              </div>
+              <div>
+                <Label>Postcode</Label>
+                <Input value={org.postcode} onChange={(e)=>setOrg(o=>({...o, postcode: e.target.value}))} />
+              </div>
+              <div>
+                <Label>Default labour rate (cents)</Label>
+                <Input
+                  type="number"
+                  value={org.default_labour_rate_cents}
+                  onChange={(e)=>setOrg(o=>({...o, default_labour_rate_cents: Number(e.target.value||0)}))}
+                  placeholder="e.g. 12500 = $125.00/hr"
+                />
+              </div>
+              <div className="md:col-span-2 flex justify-end">
+                <Button onClick={saveOrg}>Save Organization</Button>
+              </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        {/* Subscription (read-only for now) */}
+        <TabsContent value="subscription" className="mt-4">
+          <Card>
+            <CardHeader><CardTitle>Subscription</CardTitle></CardHeader>
+            <CardContent className="space-y-2">
+              <div>Plan: <strong>{data?.org?.plan || "free"}</strong></div>
+              <div>Renews: {data?.org?.plan_renews_at ? new Date(data.org.plan_renews_at).toLocaleDateString() : "—"}</div>
+              <Button disabled title="Coming soon">Manage in Stripe</Button>
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        {/* Security */}
+        <TabsContent value="security" className="mt-4">
+          <Card>
+            <CardHeader><CardTitle>Change Password</CardTitle></CardHeader>
+            <CardContent className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <Label>Current password</Label>
+                <Input type="password" value={pw.current} onChange={(e)=>setPw(p=>({...p, current: e.target.value}))} />
+              </div>
+              <div>
+                <Label>New password</Label>
+                <Input type="password" value={pw.next} onChange={(e)=>setPw(p=>({...p, next: e.target.value}))} />
+              </div>
+              <div>
+                <Label>Confirm new password</Label>
+                <Input type="password" value={pw.confirm} onChange={(e)=>setPw(p=>({...p, confirm: e.target.value}))} />
+              </div>
+              <div className="md:col-span-2 flex justify-end">
+                <Button onClick={changePassword}>Change Password</Button>
+              </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+      </Tabs>
+    </div>
+  );
+}
+
+4) Wire the route
+
+File: client/src/App.tsx
+Add:
+
+import SettingsPage from "@/pages/settings";
+// ...
+<Route path="/settings" component={SettingsPage} />
+
+5) Make the sidebar user chip open Settings
+
+File: client/src/components/layout/sidebar.tsx
+Wrap the user box with a Link to /settings (or add an onClick). Example:
+
+import { Link } from "wouter";
+// ...
+<div className="absolute bottom-6 left-6 right-6">
+  <Link href="/settings">
+    <a className="block">
+      <div className="flex items-center gap-3 p-3 bg-gray-50 rounded-lg hover:bg-gray-100 transition">
+        {/* existing avatar + name + role */}
+      </div>
+    </a>
+  </Link>
+</div>
+
+6) (Optional) Use defaults in charges
+
+Whenever you build a new charge line with description “Labour”, prefill unit price from org.default_labour_rate_cents (divide by 100 for dollars). You can fetch /api/me once on app load and stash it in context.

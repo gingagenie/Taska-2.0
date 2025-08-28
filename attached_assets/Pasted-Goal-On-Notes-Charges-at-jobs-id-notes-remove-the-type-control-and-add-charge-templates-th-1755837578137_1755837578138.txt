@@ -1,0 +1,252 @@
+Goal:
+On Notes & Charges (at /jobs/:id/notes), remove the “type” control and add charge templates that:
+
+remember description + unit price in localStorage per org,
+
+auto-suggest as the user types,
+
+auto-fill the unit price when a template is selected or exactly matched.
+
+Acceptance criteria:
+
+Charges UI shows Description, Quantity, Unit price only. No “type”.
+
+When I add a charge (e.g., “Labour” @ 125), it’s remembered.
+
+Next time I type “lab…”, suggestions appear; picking one auto-fills the unit price.
+
+Clicking Add charge saves the charge and (if enabled) remembers/updates the template.
+
+Page refresh preserves templates (via localStorage).
+
+No spinners hang; errors show inline if any API fails.
+
+Files to edit
+1) client/src/pages/job-notes-charges.tsx
+
+Step A — Ensure imports:
+At the top of the file, ensure these imports exist (add any missing):
+
+import { useEffect, useState, useMemo } from "react";
+import { Label } from "@/components/ui/label";
+import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
+
+
+Step B — Add state + helpers (inside the component):
+Add these right after the other useState hooks:
+
+// org-scoped templates in localStorage
+const orgId = useMemo(() => localStorage.getItem("x-org-id") || "default-org", []);
+type ChargeTemplate = { description: string; unitPrice: number };
+const TEMPLATES_KEY = `chargeTemplates:${orgId}`;
+
+const [templates, setTemplates] = useState<ChargeTemplate[]>([]);
+const [autoSaveTemplate, setAutoSaveTemplate] = useState(true);
+const [suggestions, setSuggestions] = useState<ChargeTemplate[]>([]);
+
+// load templates on mount
+useEffect(() => {
+  try {
+    const raw = localStorage.getItem(TEMPLATES_KEY);
+    if (raw) setTemplates(JSON.parse(raw));
+  } catch { /* ignore */ }
+}, [TEMPLATES_KEY]);
+
+function persistTemplates(next: ChargeTemplate[]) {
+  setTemplates(next);
+  try { localStorage.setItem(TEMPLATES_KEY, JSON.stringify(next)); } catch {}
+}
+
+// update suggestions and auto-fill unit price on exact match
+useEffect(() => {
+  const q = (chargeDesc || "").trim().toLowerCase();
+  if (!q) { setSuggestions([]); return; }
+  const matches = templates
+    .filter(t => t.description.toLowerCase().includes(q))
+    .slice(0, 6);
+  setSuggestions(matches);
+
+  const exact = templates.find(t => t.description.toLowerCase() === q);
+  if (exact) setChargeUnit(exact.unitPrice);
+}, [chargeDesc, templates]);
+
+function applyTemplate(t: ChargeTemplate) {
+  setChargeDesc(t.description);
+  setChargeUnit(t.unitPrice);
+  setSuggestions([]);
+}
+
+function rememberTemplate(desc: string, price: number) {
+  const d = desc.trim();
+  if (!d) return;
+  const exists = templates.find(t => t.description.toLowerCase() === d.toLowerCase());
+  const next = exists
+    ? templates.map(t => t.description.toLowerCase() === d.toLowerCase() ? { description: d, unitPrice: price } : t)
+    : [{ description: d, unitPrice: price }, ...templates].slice(0, 50); // cap list
+  persistTemplates(next);
+}
+
+
+Step C — Replace the entire Charges <Card> block
+Find the <Card> that renders the Charges UI and replace its entire content with this:
+
+<Card>
+  <CardHeader><CardTitle>Charges</CardTitle></CardHeader>
+  <CardContent className="space-y-3">
+    <div>
+      <Label>Description</Label>
+      <div className="relative">
+        <Input
+          placeholder="e.g., Labour"
+          value={chargeDesc}
+          onChange={(e) => setChargeDesc(e.target.value)}
+        />
+        {suggestions.length > 0 && (
+          <div className="absolute z-10 mt-1 w-full rounded border bg-white shadow">
+            {suggestions.map((s) => (
+              <button
+                key={s.description}
+                type="button"
+                className="w-full px-3 py-2 text-left hover:bg-gray-50"
+                onClick={() => applyTemplate(s)}
+              >
+                <div className="font-medium">{s.description}</div>
+                <div className="text-xs text-gray-500">${Number(s.unitPrice).toFixed(2)}</div>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Quick-pick chips */}
+      {templates.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-2">
+          {templates.slice(0, 6).map((t) => (
+            <button key={t.description} type="button" onClick={() => applyTemplate(t)}>
+              <Badge variant="secondary">
+                {t.description} — ${Number(t.unitPrice).toFixed(2)}
+              </Badge>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+
+    <div className="grid grid-cols-2 gap-2">
+      <div>
+        <Label>Quantity</Label>
+        <Input
+          type="number"
+          step="0.25"
+          placeholder="Qty"
+          value={String(chargeQty)}
+          onChange={(e) => setChargeQty(Number(e.target.value))}
+        />
+      </div>
+      <div>
+        <Label>Unit price</Label>
+        <Input
+          type="number"
+          step="0.01"
+          placeholder="0.00"
+          value={String(chargeUnit)}
+          onChange={(e) => setChargeUnit(Number(e.target.value))}
+        />
+      </div>
+    </div>
+
+    <div className="flex items-center gap-2">
+      <input
+        id="autosave-template"
+        type="checkbox"
+        className="h-4 w-4"
+        checked={autoSaveTemplate}
+        onChange={(e) => setAutoSaveTemplate(e.target.checked)}
+      />
+      <label htmlFor="autosave-template" className="text-sm text-gray-700">
+        Remember this description & price for next time
+      </label>
+    </div>
+
+    <Button
+      onClick={async () => {
+        if (!chargeDesc.trim()) { setErr("Charge description is required"); return; }
+        setSaving(true);
+        try {
+          await api(`/api/jobs/${jobId}/charges`, {
+            method: "POST",
+            body: JSON.stringify({
+              description: chargeDesc.trim(),
+              quantity: Number(chargeQty) || 0,
+              unitPrice: Number(chargeUnit) || 0,
+            }),
+          });
+          if (autoSaveTemplate) {
+            rememberTemplate(chargeDesc.trim(), Number(chargeUnit) || 0);
+          }
+          setChargeDesc(""); setChargeQty(1); setChargeUnit(0);
+          await loadAll();
+        } catch (e: any) {
+          setErr(e?.message || "Failed to add charge");
+        } finally {
+          setSaving(false);
+        }
+      }}
+      disabled={saving}
+    >
+      {saving ? "Saving…" : "Add charge"}
+    </Button>
+
+    {/* Existing charges list + total (unchanged) */}
+    <div className="pt-2 space-y-2">
+      {charges.length === 0 && <div className="text-gray-500">No charges yet</div>}
+      {charges.map((c) => (
+        <div key={c.id} className="flex items-center justify-between border rounded p-2">
+          <div>
+            <div className="font-medium">{c.description}</div>
+            <div className="text-xs text-gray-500">
+              {c.quantity} × ${Number(c.unit_price).toFixed(2)}
+            </div>
+          </div>
+          <div className="font-semibold">${Number(c.total).toFixed(2)}</div>
+        </div>
+      ))}
+      <div className="flex items-center justify-between border-t pt-2 mt-2">
+        <div className="font-semibold">Total</div>
+        <div className="font-bold">${charges.reduce((s, c) => s + Number(c.total || 0), 0).toFixed(2)}</div>
+      </div>
+    </div>
+  </CardContent>
+</Card>
+
+
+Step D — Remove any “type” UI
+If there’s a dropdown/select for “type”, delete it entirely. We’re not sending kind from the client anymore; the server can default it if the column is required.
+
+No backend changes required
+
+We’re still posting to:
+
+POST /api/jobs/:jobId/charges
+{
+  "description": string,
+  "quantity": number,
+  "unitPrice": number
+}
+
+
+If your table requires kind, keep a server-side default ('labour').
+
+Quick test script
+
+Go to Notes & Charges for any job.
+
+Add a charge: Description = Labour, Qty 2, Unit price 125 → Add charge.
+
+Refresh page → charge shows with total.
+
+Start typing lab… → suggestion shows “Labour — $125.00”; pick it → Unit price auto-fills to 125.
+
+If any step fails, fix that file and rerun.

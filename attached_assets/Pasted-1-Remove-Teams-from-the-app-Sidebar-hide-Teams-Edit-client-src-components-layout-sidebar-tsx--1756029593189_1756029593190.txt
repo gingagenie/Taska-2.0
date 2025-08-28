@@ -1,0 +1,309 @@
+1) Remove “Teams” from the app
+Sidebar: hide Teams
+
+Edit: client/src/components/layout/sidebar.tsx
+
+- { path: "/teams", label: "Teams", icon: UsersRound },
+
+Router: remove Teams route
+
+Edit: client/src/App.tsx
+
+- <Route path="/teams" component={TeamsPage} />
+
+
+If there’s a Teams link elsewhere, comment it out. No DB changes required.
+
+2) Assign members during New Job creation
+
+We’ll keep your existing job_assignments table and simply allow creating assignments at create time.
+
+Backend: accept assignedTechIds on create
+
+Edit: server/routes/jobs.ts
+
+- const { title, description, customerId, scheduledAt } = req.body || {};
++ const { title, description, customerId, scheduledAt, assignedTechIds } = req.body || {};
+
+  if (!title) return res.status(400).json({ error: "title required" });
+
+  if (customerId === "") customerId = null;
+  if (scheduledAt === "") scheduledAt = null;
+
+  const r: any = await db.execute(sql`
+    insert into jobs (org_id, customer_id, title, description, scheduled_at, status, created_by)
+    values (
+      ${orgId}::uuid,
+      case when ${customerId} is null then null else (${customerId}::uuid) end,
+      ${title},
+      ${description || null},
+      ${scheduledAt || null},
+      'new',
+      ${userId || null}
+    )
+    returning id
+  `);
+  const jobId = r.rows[0].id;
+
++ // create job assignments if provided
++ if (Array.isArray(assignedTechIds) && assignedTechIds.length > 0) {
++   for (const uid of assignedTechIds) {
++     if (!uid) continue;
++     await db.execute(sql`
++       insert into job_assignments (job_id, user_id)
++       values (${jobId}::uuid, ${uid}::uuid)
++       on conflict do nothing
++     `);
++   }
++ }
+
+  res.json({ ok: true, id: jobId });
+
+Frontend: multi-select techs on New Job form
+
+Assuming you already have users (members) listing via /api/members (or /api/teams previously). If you don’t, we’ll expose a simple members list route below.
+
+Client API helper (if missing)
+
+Edit: client/src/lib/api.ts
+
+export const membersApi = {
+  getAll: () => api("/api/members"),
+};
+
+New Job modal/page: add members picker
+
+Edit: client/src/components/modals/job-modal.tsx (or pages/job-new.tsx)
+
++ import { useQuery } from "@tanstack/react-query";
++ import { membersApi, jobsApi } from "@/lib/api";
++ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"; // if you have a tags/multi select component, use that
+
+  export function JobModal({...}) {
++   const { data: members = [] } = useQuery({
++     queryKey: ["/api/members"],
++     queryFn: membersApi.getAll,
++   });
+
++   const [assignedTechIds, setAssignedTechIds] = useState<string[]>([]);
+
+    async function createJob() {
+      setSaving(true); setErr(null);
+      try {
+        await jobsApi.create({
+          title, description, customerId: customerId || null,
+          scheduledAt: scheduledAt || null,
++         assignedTechIds,
+        });
+        // invalidate queries etc…
+        onOpenChange(false);
+      } catch (e:any) {
+        setErr(e.message || "Failed to create job");
+      } finally {
+        setSaving(false);
+      }
+    }
+
+    return (
+      {/* ...other fields ... */}
+
++     <div>
++       <label className="block text-sm font-medium mb-1">Assign technicians</label>
++       {/* Simple multi-select using native <select multiple>. Replace with your chips control if you prefer */}
++       <select
++         multiple
++         className="w-full border rounded p-2 h-28"
++         value={assignedTechIds}
++         onChange={(e) => {
++           const opts = Array.from(e.target.selectedOptions).map(o => o.value);
++           setAssignedTechIds(opts);
++         }}
++       >
++         {members.map((m:any) => (
++           <option key={m.id} value={m.id}>{m.name} ({m.role})</option>
++         ))}
++       </select>
++       <div className="text-xs text-gray-500 mt-1">Tip: Ctrl/Cmd-click to select multiple</div>
++     </div>
+
+      {/* Save button */}
+    );
+  }
+
+If you don’t have a members list endpoint yet
+
+Create: server/routes/members.ts
+
+import { Router } from "express";
+import { db } from "../db/client";
+import { sql } from "drizzle-orm";
+import { requireAuth } from "../middleware/auth";
+import { requireOrg } from "../middleware/tenancy";
+
+export const members = Router();
+
+members.get("/", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  const r: any = await db.execute(sql`
+    select id, name, email, role
+    from users
+    where org_id=${orgId}::uuid
+    order by name asc
+  `);
+  res.json(r.rows);
+});
+
+
+Mount: server/index.ts (or routes.ts)
+
+import { members } from "./routes/members";
+app.use("/api/members", members);
+
+3) “Edit Member” button on member cards
+Member card UI
+
+Edit: client/src/pages/members.tsx (or wherever you list members)
+
++ import { useState } from "react";
++ import MemberEditModal from "@/components/modals/member-edit-modal";
+
+  export default function MembersPage() {
++   const [editing, setEditing] = useState<any|null>(null);
+
+    return (
+      <div className="grid gap-3">
+        {members.map((m:any) => (
+          <Card key={m.id} className="p-3 flex items-center justify-between">
+            <div>
+              <div className="font-medium">{m.name}</div>
+              <div className="text-xs text-gray-500">{m.email} • {m.role}</div>
+            </div>
+            <div className="flex items-center gap-2">
++             <Button variant="outline" size="sm" onClick={() => setEditing(m)}>
++               Edit
++             </Button>
+            </div>
+          </Card>
+        ))}
++       <MemberEditModal
++         member={editing}
++         open={!!editing}
++         onOpenChange={(v)=>!v && setEditing(null)}
++       />
+      </div>
+    );
+  }
+
+Edit modal
+
+Create: client/src/components/modals/member-edit-modal.tsx
+
+import { useEffect, useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { api } from "@/lib/api";
+import { useQueryClient } from "@tanstack/react-query";
+
+export default function MemberEditModal({
+  member, open, onOpenChange,
+}: { member: any|null; open: boolean; onOpenChange: (v:boolean)=>void }) {
+  const qc = useQueryClient();
+  const [name, setName] = useState(""); 
+  const [email, setEmail] = useState("");
+  const [role, setRole] = useState("technician");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string|null>(null);
+
+  useEffect(()=> {
+    if (member) {
+      setName(member.name || "");
+      setEmail(member.email || "");
+      setRole(member.role || "technician");
+    }
+  }, [member]);
+
+  async function save() {
+    if (!member) return;
+    setSaving(true); setErr(null);
+    try {
+      await api(`/api/members/${member.id}`, {
+        method: "PUT",
+        body: JSON.stringify({ name, email, role }),
+      });
+      qc.invalidateQueries({ queryKey: ["/api/members"] });
+      onOpenChange(false);
+    } catch (e:any) {
+      setErr(e.message || "Failed to save");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (!open || !member) return null;
+
+  return (
+    <div className="fixed inset-0 bg-black/30 flex items-end sm:items-center justify-center z-50">
+      <div className="bg-white w-full sm:max-w-md rounded-t-2xl sm:rounded-2xl p-4 sm:p-6">
+        <div className="text-lg font-semibold mb-4">Edit Member</div>
+        {err && <div className="text-sm text-red-600 mb-2">{err}</div>}
+        <div className="space-y-3">
+          <div>
+            <label className="text-sm">Name</label>
+            <Input value={name} onChange={(e)=>setName(e.target.value)} />
+          </div>
+          <div>
+            <label className="text-sm">Email</label>
+            <Input type="email" value={email} onChange={(e)=>setEmail(e.target.value)} />
+          </div>
+          <div>
+            <label className="text-sm">Role</label>
+            <Select value={role} onValueChange={setRole}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="technician">Technician</SelectItem>
+                <SelectItem value="manager">Manager</SelectItem>
+                <SelectItem value="admin">Admin</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+        <div className="mt-5 flex gap-2">
+          <Button variant="outline" className="flex-1" onClick={()=>onOpenChange(false)}>Cancel</Button>
+          <Button className="flex-1" onClick={save} disabled={saving}>{saving ? "Saving…" : "Save"}</Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+Backend: Member update route
+
+Edit/Create: server/routes/members.ts
+
+export const members = Router();
+
++ // update member (name/email/role)
++ members.put("/:memberId", requireAuth, requireOrg, async (req, res) => {
++   const orgId = (req as any).orgId;
++   const { memberId } = req.params;
++   const { name, email, role } = req.body || {};
++   await db.execute(sql`
++     update users
++       set name = coalesce(${name}, name),
++           email = coalesce(${email}, email),
++           role  = coalesce(${role}, role)
++     where id=${memberId}::uuid and org_id=${orgId}::uuid
++   `);
++   res.json({ ok: true });
++ });
+
+Notes / Safety
+
+Removing Teams doesn’t break anything data-wise; we’re just not exposing team grouping UI. job_assignments keeps working.
+
+Assign at creation simply writes rows to job_assignments after the job insert.
+
+Edit member only updates the user inside the current org (guarded by requireOrg).
+
+If you want a nicer chips-style multi-select for techs, say the word and I’ll swap the native <select multiple> for a pretty tags control using your shadcn components.

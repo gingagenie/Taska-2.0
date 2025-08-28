@@ -1,0 +1,85 @@
+Replit Agent — Clean customers and add FK to orgs(id)
+0) Diagnose (log to console)
+-- How many rows exist?
+SELECT COUNT(*) AS customers_count FROM customers;
+
+-- Which org_ids in customers don’t exist in orgs?
+SELECT DISTINCT c.org_id
+FROM customers c
+LEFT JOIN orgs o ON o.id = c.org_id
+WHERE c.org_id IS NOT NULL AND o.id IS NULL;
+
+-- Any non-UUID junk?
+SELECT org_id
+FROM customers
+WHERE org_id IS NOT NULL
+  AND org_id::text !~ '^[0-9a-f-]{8}-[0-9a-f-]{4}-[0-9a-f-]{4}-[0-9a-f-]{4}-[0-9a-f-]{12}$'
+LIMIT 50;
+
+1) Normalize column type (guarded)
+BEGIN;
+
+-- If org_id isn’t uuid yet, cast it safely (empty/junk → NULL so cast won’t explode)
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_name = 'customers'
+      AND column_name = 'org_id'
+      AND data_type <> 'uuid'
+  ) THEN
+    UPDATE customers
+       SET org_id = NULL
+     WHERE org_id IS NOT NULL
+       AND (org_id::text !~ '^[0-9a-f-]{8}-[0-9a-f-]{4}-[0-9a-f-]{4}-[0-9a-f-]{4}-[0-9a-f-]{12}$');
+
+    ALTER TABLE customers
+      ALTER COLUMN org_id TYPE uuid USING NULLIF(org_id::text,'')::uuid;
+  END IF;
+END$$;
+
+COMMIT;
+
+2) (Since the user says there are no real customers) remove only bad rows
+
+This avoids nuking any legit future data and won’t cascade into jobs.
+
+BEGIN;
+
+-- Delete any rows whose org_id points to a non-existent org
+DELETE FROM customers c
+USING (
+  SELECT c.id
+  FROM customers c
+  LEFT JOIN orgs o ON o.id = c.org_id
+  WHERE c.org_id IS NOT NULL AND o.id IS NULL
+) bad
+WHERE c.id = bad.id;
+
+COMMIT;
+
+
+(If you truly want a clean slate, you can TRUNCATE customers; instead—but the selective delete above is safer.)
+
+3) Ensure FK points to orgs(id)
+BEGIN;
+
+-- Drop old/wrong FK if present
+ALTER TABLE customers DROP CONSTRAINT IF EXISTS customers_org_id_fkey;
+
+-- Add the correct FK (NULLs allowed)
+ALTER TABLE customers
+  ADD CONSTRAINT customers_org_id_fkey
+  FOREIGN KEY (org_id) REFERENCES orgs(id)
+  ON UPDATE CASCADE ON DELETE RESTRICT;
+
+COMMIT;
+
+4) Quick sanity after
+
+Hit GET /api/debug/whoami while logged in on taska.info → effectiveOrgId must be non-null.
+
+Create a customer from the app → should 200.
+
+If it still errors, run the diagnostics again and paste the outputs (counts + the list of bad org_ids). That will tell us exactly what row is still violating.

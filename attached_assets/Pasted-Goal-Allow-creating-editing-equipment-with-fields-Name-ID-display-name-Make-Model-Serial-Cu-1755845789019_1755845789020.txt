@@ -1,0 +1,428 @@
+Goal:
+Allow creating/editing equipment with fields:
+
+Name/ID (display name)
+
+Make
+
+Model
+
+Serial
+
+Customer (dropdown)
+
+Address (auto-populated from selected customer; read-only)
+
+Notes (free text)
+
+Acceptance criteria:
+
+Equipment list shows equipment with linked customer + one-line address.
+
+“New Equipment” modal includes the fields above; Customer dropdown lists customers; selecting a customer shows their address immediately (read-only).
+
+Create/Update respects multi-tenant via org_id.
+
+React Query invalidation refreshes the list after create/edit.
+
+No page refresh required.
+
+0) DB — Add columns (Neon)
+
+If missing, add these to equipment:
+
+alter table equipment
+  add column if not exists name text,
+  add column if not exists make text,
+  add column if not exists model text,
+  add column if not exists serial text,
+  add column if not exists notes text,
+  add column if not exists customer_id uuid;
+
+-- Optional index to speed joins:
+create index if not exists idx_equipment_customer on equipment(customer_id);
+
+
+(If you maintain a Drizzle schema, mirror these fields there.)
+
+1) Backend — server/routes/equipment.ts
+
+Create/replace the router below. It joins customers to return customer_name + address in list/get. For the dropdown we reuse your existing /api/jobs/customers (id + name). The modal will fetch the full address on selection via /api/customers/:id.
+
+import { Router } from "express";
+import { db } from "../db/client";
+import { sql } from "drizzle-orm";
+import { requireAuth } from "../middleware/auth";
+import { requireOrg } from "../middleware/tenancy";
+
+export const equipment = Router();
+const isUuid = (v?: string) => !!v && /^[0-9a-f-]{36}$/i.test(v);
+
+/* LIST: equipment + customer name + address */
+equipment.get("/", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  const r: any = await db.execute(sql`
+    select
+      e.id, e.name, e.make, e.model, e.serial, e.notes,
+      e.customer_id,
+      coalesce(c.name,'—') as customer_name,
+      -- one-line address from customer
+      nullif(trim(concat_ws(', ',
+        nullif(c.street,''),
+        nullif(c.suburb,''),
+        nullif(c.state,''),
+        nullif(c.postcode,'')
+      )), '') as customer_address
+    from equipment e
+    left join customers c on c.id = e.customer_id
+    where e.org_id = ${orgId}::uuid
+    order by e.name nulls last, e.created_at desc
+  `);
+  res.json(r.rows);
+});
+
+/* GET ONE */
+equipment.get("/:id", requireAuth, requireOrg, async (req, res) => {
+  const { id } = req.params;
+  const orgId = (req as any).orgId;
+  if (!isUuid(id)) return res.status(400).json({ error: "invalid id" });
+
+  const r: any = await db.execute(sql`
+    select
+      e.id, e.name, e.make, e.model, e.serial, e.notes, e.customer_id,
+      coalesce(c.name,'—') as customer_name,
+      nullif(trim(concat_ws(', ',
+        nullif(c.street,''),
+        nullif(c.suburb,''),
+        nullif(c.state,''),
+        nullif(c.postcode,'')
+      )), '') as customer_address
+    from equipment e
+    left join customers c on c.id = e.customer_id
+    where e.id=${id}::uuid and e.org_id=${orgId}::uuid
+  `);
+  const row = r.rows?.[0];
+  if (!row) return res.status(404).json({ error: "not found" });
+  res.json(row);
+});
+
+/* CREATE */
+equipment.post("/", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  let { name, make, model, serial, notes, customerId } = req.body || {};
+  if (customerId === "") customerId = null;
+
+  const r: any = await db.execute(sql`
+    insert into equipment (org_id, name, make, model, serial, notes, customer_id)
+    values (
+      ${orgId}::uuid,
+      ${name || null},
+      ${make || null},
+      ${model || null},
+      ${serial || null},
+      ${notes || null},
+      case when ${customerId} is null then null else (${customerId}::uuid) end
+    )
+    returning id
+  `);
+  res.json({ ok: true, id: r.rows[0].id });
+});
+
+/* UPDATE */
+equipment.put("/:id", requireAuth, requireOrg, async (req, res) => {
+  const { id } = req.params;
+  const orgId = (req as any).orgId;
+  if (!isUuid(id)) return res.status(400).json({ error: "invalid id" });
+
+  let { name, make, model, serial, notes, customerId } = req.body || {};
+  if (customerId === "") customerId = null;
+
+  await db.execute(sql`
+    update equipment set
+      name        = coalesce(${name}, name),
+      make        = coalesce(${make}, make),
+      model       = coalesce(${model}, model),
+      serial      = coalesce(${serial}, serial),
+      notes       = coalesce(${notes}, notes),
+      customer_id = case when ${customerId} is null then null else (${customerId}::uuid) end
+    where id=${id}::uuid and org_id=${orgId}::uuid
+  `);
+  res.json({ ok: true });
+});
+
+export default equipment;
+
+
+Mount it in server/routes.ts (or wherever you register routers):
+
+import equipment from "./routes/equipment";
+app.use("/api/equipment", equipment);
+console.log("[mount] /api/equipment");
+
+2) Client API — client/src/lib/api.ts
+
+You already have equipmentApi. Ensure it matches:
+
+export const equipmentApi = {
+  getAll: () => api("/api/equipment"),
+  get: (id: string) => api(`/api/equipment/${id}`),
+  create: (body: any) => api("/api/equipment", { method: "POST", body: JSON.stringify(body) }),
+  update: (id: string, body: any) => api(`/api/equipment/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+};
+
+
+We’ll also reuse customersApi.get(id) and jobsApi.customers() for dropdown (id + name).
+
+3) Equipment Modal — client/src/components/modals/equipment-modal.tsx
+
+Create this file (create+edit). On customer selection, it fetches full customer to show address.
+
+import { useEffect, useState } from "react";
+import { equipmentApi, jobsApi, customersApi } from "@/lib/api";
+import { useQueryClient } from "@tanstack/react-query";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Label } from "@/components/ui/label";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import { Button } from "@/components/ui/button";
+
+type Props = {
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  equipment?: any;           // if provided -> edit mode
+  onSaved?: (row: any) => void;
+};
+
+export function EquipmentModal({ open, onOpenChange, equipment, onSaved }: Props) {
+  const isEdit = !!equipment;
+  const qc = useQueryClient();
+
+  const [name, setName] = useState("");
+  const [make, setMake] = useState("");
+  const [model, setModel] = useState("");
+  const [serial, setSerial] = useState("");
+  const [notes, setNotes] = useState("");
+  const [customerId, setCustomerId] = useState<string>("");
+
+  const [customerList, setCustomerList] = useState<any[]>([]);
+  const [customerAddress, setCustomerAddress] = useState<string>("");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string|null>(null);
+
+  // load dropdown (id + name)
+  useEffect(() => {
+    if (!open) return;
+    jobsApi.customers().then(setCustomerList).catch(()=>setCustomerList([]));
+  }, [open]);
+
+  // prefill when editing
+  useEffect(() => {
+    if (open && isEdit) {
+      setName(equipment.name || "");
+      setMake(equipment.make || "");
+      setModel(equipment.model || "");
+      setSerial(equipment.serial || "");
+      setNotes(equipment.notes || "");
+      setCustomerId(equipment.customer_id || "");
+      setCustomerAddress(equipment.customer_address || "");
+    }
+    if (open && !isEdit) {
+      setName(""); setMake(""); setModel(""); setSerial(""); setNotes("");
+      setCustomerId(""); setCustomerAddress(""); setErr(null);
+    }
+  }, [open, isEdit, equipment]);
+
+  // fetch address on customer selection
+  useEffect(() => {
+    (async () => {
+      if (!customerId) { setCustomerAddress(""); return; }
+      try {
+        const c = await customersApi.get(customerId);
+        const addr = [c.street, c.suburb, c.state, c.postcode].filter(Boolean).join(", ");
+        setCustomerAddress(addr);
+      } catch {
+        setCustomerAddress("");
+      }
+    })();
+  }, [customerId]);
+
+  async function save() {
+    setSaving(true); setErr(null);
+    try {
+      if (isEdit) {
+        await equipmentApi.update(equipment.id, { name, make, model, serial, notes, customerId });
+        // keep detail pages fresh if any
+        qc.invalidateQueries({ queryKey: ["/api/equipment"] });
+        qc.invalidateQueries({ queryKey: [`/api/equipment/${equipment.id}`] });
+        onSaved?.({ ...equipment, name, make, model, serial, notes, customer_id: customerId, customer_address: customerAddress });
+      } else {
+        const res = await equipmentApi.create({ name, make, model, serial, notes, customerId });
+        qc.invalidateQueries({ queryKey: ["/api/equipment"] });
+      }
+      onOpenChange(false);
+    } catch (e: any) {
+      setErr(e.message || "Failed to save");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-xl">
+        <DialogHeader><DialogTitle>{isEdit ? "Edit Equipment" : "New Equipment"}</DialogTitle></DialogHeader>
+
+        {err && <div className="text-red-600 text-sm">{err}</div>}
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div className="md:col-span-2">
+            <Label>Name / ID</Label>
+            <Input value={name} onChange={(e)=>setName(e.target.value)} placeholder="e.g., Split System #04" />
+          </div>
+
+          <div>
+            <Label>Make</Label>
+            <Input value={make} onChange={(e)=>setMake(e.target.value)} placeholder="Mitsubishi" />
+          </div>
+          <div>
+            <Label>Model</Label>
+            <Input value={model} onChange={(e)=>setModel(e.target.value)} placeholder="SRK50ZSA" />
+          </div>
+
+          <div className="md:col-span-2">
+            <Label>Serial</Label>
+            <Input value={serial} onChange={(e)=>setSerial(e.target.value)} placeholder="SN-123456" />
+          </div>
+
+          <div className="md:col-span-2">
+            <Label>Customer</Label>
+            <select
+              className="w-full border rounded p-2"
+              value={customerId}
+              onChange={(e)=>setCustomerId(e.target.value)}
+            >
+              <option value="">— None —</option>
+              {customerList.map((c) => (
+                <option key={c.id} value={c.id}>{c.name}</option>
+              ))}
+            </select>
+          </div>
+
+          <div className="md:col-span-2">
+            <Label>Address (auto from customer)</Label>
+            <Input readOnly value={customerAddress} placeholder="Select a customer to auto-fill" />
+          </div>
+
+          <div className="md:col-span-2">
+            <Label>Notes</Label>
+            <Textarea rows={4} value={notes} onChange={(e)=>setNotes(e.target.value)} placeholder="Any relevant details…" />
+          </div>
+        </div>
+
+        <div className="pt-3 flex justify-end gap-2">
+          <Button variant="outline" onClick={()=>onOpenChange(false)} disabled={saving}>Cancel</Button>
+          <Button onClick={save} disabled={saving}>{saving ? "Saving…" : (isEdit ? "Save changes" : "Create equipment")}</Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+4) Equipment Page — client/src/pages/equipment.tsx
+
+Tidy list with customer + address, and “New Equipment” button (opens the modal).
+
+import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { equipmentApi } from "@/lib/api";
+import { useLocation } from "wouter";
+import { Card, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { EquipmentModal } from "@/components/modals/equipment-modal";
+import { MapPin } from "lucide-react";
+
+function addrLine(e: any) {
+  return e.customer_address || "";
+}
+
+export default function EquipmentPage() {
+  const { data: list = [], isLoading } = useQuery({ queryKey: ["/api/equipment"], queryFn: equipmentApi.getAll });
+  const [q, setQ] = useState("");
+  const [open, setOpen] = useState(false);
+  const [, navigate] = useLocation();
+
+  const filtered = (list as any[]).filter((e) =>
+    [e.name, e.make, e.model, e.serial, e.customer_name, addrLine(e)]
+      .join(" ")
+      .toLowerCase()
+      .includes(q.toLowerCase())
+  );
+
+  return (
+    <div className="p-6 space-y-4">
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <h1 className="text-2xl font-bold">Equipment</h1>
+        <div className="flex gap-2">
+          <Input className="w-72" placeholder="Search name, make, model, serial…" value={q} onChange={(e)=>setQ(e.target.value)} />
+          <Button onClick={()=>setOpen(true)}>New Equipment</Button>
+        </div>
+      </div>
+
+      {isLoading ? (
+        <Card><CardContent className="py-10 text-center text-sm text-gray-500">Loading…</CardContent></Card>
+      ) : filtered.length === 0 ? (
+        <Card><CardContent className="py-10 text-center text-sm text-gray-500">No equipment found</CardContent></Card>
+      ) : (
+        <div className="overflow-x-auto rounded-xl border border-gray-200 bg-white">
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50 text-gray-600 text-xs uppercase sticky top-0 z-10">
+              <tr className="[&>th]:px-4 [&>th]:py-3">
+                <th className="text-left">Name / ID</th>
+                <th className="text-left">Make</th>
+                <th className="text-left">Model</th>
+                <th className="text-left">Serial</th>
+                <th className="text-left">Customer</th>
+                <th className="text-left">Address</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {filtered.map((e: any, i: number) => (
+                <tr key={e.id} className={`hover:bg-gray-50 ${i%2 ? "bg-gray-50/30" : "bg-white"}`} onClick={()=>navigate(`/equipment/${e.id}`)}>
+                  <td className="px-4 py-3">{e.name || "—"}</td>
+                  <td className="px-4 py-3">{e.make || "—"}</td>
+                  <td className="px-4 py-3">{e.model || "—"}</td>
+                  <td className="px-4 py-3">{e.serial || "—"}</td>
+                  <td className="px-4 py-3">{e.customer_name || "—"}</td>
+                  <td className="px-4 py-3">
+                    <div className="flex items-center gap-1 text-gray-700 truncate max-w-[360px]">
+                      <MapPin className="h-3.5 w-3.5 opacity-60" />
+                      <span className="truncate">{addrLine(e) || "—"}</span>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <EquipmentModal open={open} onOpenChange={setOpen} />
+    </div>
+  );
+}
+
+
+(If you don’t have an equipment detail page yet, the row click can be removed or we can scaffold /equipment/:id similarly to jobs/customers.)
+
+5) Test checklist
+
+Open Equipment → click New Equipment.
+
+Select Customer → address line fills in automatically (read-only).
+
+Save → list refreshes without page reload.
+
+Edit an existing piece of equipment → change customer → address updates.
+
+Multi-tenant still enforced (all queries scoped by org_id on the server).

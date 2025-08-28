@@ -1,0 +1,669 @@
+1) Run this SQL on Neon (idempotent)
+
+Create (or append to) a migration and apply it:
+
+-- Users: add columns if missing
+alter table users
+  add column if not exists email text,
+  add column if not exists role text,
+  add column if not exists org_id uuid;
+
+-- Unique per org on lower(email)
+create unique index if not exists users_org_email_unique
+  on users (org_id, lower(email));
+
+-- Helpful index
+create index if not exists users_org_idx on users(org_id);
+
+2) Create file: server/routes/members.ts
+import { Router } from "express";
+import { db } from "../db/client";
+import { sql } from "drizzle-orm";
+import { requireAuth } from "../middleware/auth";
+import { requireOrg } from "../middleware/tenancy";
+
+const isUuid = (v?: string) => !!v && /^[0-9a-f-]{36}$/i.test(v);
+const ALLOWED_ROLES = new Set(["technician", "manager", "admin"]);
+
+const members = Router();
+
+/** List org members */
+members.get("/", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  const r: any = await db.execute(sql`
+    select id, email, name, role, phone, avatar_url, created_at
+    from users
+    where org_id=${orgId}::uuid
+    order by created_at desc
+  `);
+  res.json(r.rows);
+});
+
+/** Create/Upsert member (by org_id + lower(email)) with role guard */
+members.post("/", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  let { email, name, role, phone } = req.body || {};
+  if (!email) return res.status(400).json({ error: "email required" });
+
+  email = String(email).trim();
+  const emailLC = email.toLowerCase();
+  const roleNorm = ALLOWED_ROLES.has(String(role)) ? String(role) : "technician";
+
+  const existing: any = await db.execute(sql`
+    select id from users where org_id=${orgId}::uuid and lower(email)=${emailLC}
+  `);
+
+  if (existing.rows?.[0]?.id) {
+    const id = existing.rows[0].id;
+    await db.execute(sql`
+      update users set
+        name  = coalesce(${name}, name),
+        role  = ${roleNorm},
+        phone = coalesce(${phone}, phone),
+        email = ${email}
+      where id=${id}::uuid
+    `);
+    return res.json({ ok: true, id, created: false });
+  }
+
+  const ins: any = await db.execute(sql`
+    insert into users (org_id, email, name, role, phone)
+    values (${orgId}::uuid, ${email}, ${name || null}, ${roleNorm}, ${phone || null})
+    returning id
+  `);
+  res.json({ ok: true, id: ins.rows[0].id, created: true });
+});
+
+/** Delete member (scoped to org). Removes team links first. */
+members.delete("/:userId", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  const { userId } = req.params;
+  if (!isUuid(userId)) return res.status(400).json({ error: "invalid userId" });
+
+  await db.execute(sql`delete from team_members where user_id=${userId}::uuid`);
+  await db.execute(sql`delete from users where id=${userId}::uuid and org_id=${orgId}::uuid`);
+  res.json({ ok: true });
+});
+
+/** Compat: add to team by email (optional legacy) */
+members.post("/_compat/teams-add-member", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  let { email, name, teamId, role, phone } = req.body || {};
+  if (!email) return res.status(400).json({ error: "email required" });
+  if (!isUuid(teamId)) return res.status(400).json({ error: "invalid teamId" });
+
+  email = String(email).trim();
+  const emailLC = email.toLowerCase();
+  const roleNorm = ALLOWED_ROLES.has(String(role)) ? String(role) : "technician";
+
+  const existing: any = await db.execute(sql`
+    select id from users where org_id=${orgId}::uuid and lower(email)=${emailLC}
+  `);
+
+  let userId: string;
+  if (existing.rows?.[0]?.id) {
+    userId = existing.rows[0].id;
+    await db.execute(sql`
+      update users set
+        name  = coalesce(${name}, name),
+        role  = ${roleNorm},
+        phone = coalesce(${phone}, phone),
+        email = ${email}
+      where id=${userId}::uuid
+    `);
+  } else {
+    const ins: any = await db.execute(sql`
+      insert into users (org_id, email, name, role, phone)
+      values (${orgId}::uuid, ${email}, ${name || null}, ${roleNorm}, ${phone || null})
+      returning id
+    `);
+    userId = ins.rows[0].id;
+  }
+
+  await db.execute(sql`
+    insert into team_members (team_id, user_id)
+    values (${teamId}::uuid, ${userId}::uuid)
+    on conflict do nothing
+  `);
+
+  res.json({ ok: true, userId });
+});
+
+export default members;
+
+3) Mount the router
+
+Edit: server/routes.ts (inside your registerRoutes(app)), or if you don’t have that, in server/index.ts where other routers are mounted:
+
+import members from "./routes/members";
+// ...
+app.use("/api/members", members);
+
+// (Optional legacy path)
+app.post("/api/teams/add-member", (req, res, next) => (members as any).handle(req, res, next));
+
+4) Update client API: client/src/lib/api.ts
+
+Add this block (keep all your existing exports):
+
+export const membersApi = {
+  getAll: () => api("/api/members"),
+  create: (body: any) => api("/api/members", { method: "POST", body: JSON.stringify(body) }),
+  remove: (userId: string) => api(`/api/members/${userId}`, { method: "DELETE" }),
+  addToTeamCompat: (body: { email: string; name?: string; teamId: string; role?: string; phone?: string; }) =>
+    api("/api/members/_compat/teams-add-member", { method: "POST", body: JSON.stringify(body) }),
+};
+
+5) Create page: client/src/pages/members.tsx
+import { useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { membersApi } from "@/lib/api";
+import { Card, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Label } from "@/components/ui/label";
+import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "@/components/ui/select";
+import { Trash2 } from "lucide-react";
+
+export default function MembersPage() {
+  const qc = useQueryClient();
+  const { data: list = [], isLoading } = useQuery({ queryKey: ["/api/members"], queryFn: membersApi.getAll });
+  const [q, setQ] = useState("");
+  const [open, setOpen] = useState(false);
+
+  const filtered = (list as any[]).filter((u) =>
+    [u.name, u.email, u.role, u.phone].join(" ").toLowerCase().includes(q.toLowerCase())
+  );
+
+  return (
+    <div className="p-6 space-y-4">
+      <div className="flex items-center justify-between gap-2">
+        <h1 className="text-2xl font-bold">Team Members</h1>
+        <div className="flex gap-2">
+          <Input className="w-64" placeholder="Search name, email, role…" value={q} onChange={(e)=>setQ(e.target.value)} />
+          <Button onClick={()=>setOpen(true)}>Add Member</Button>
+        </div>
+      </div>
+
+      {isLoading ? (
+        <Card><CardContent className="py-10 text-center text-sm text-gray-500">Loading…</CardContent></Card>
+      ) : (
+        <div className="overflow-x-auto rounded-xl border border-gray-200 bg-white">
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50 text-gray-600 text-xs uppercase">
+              <tr className="[&>th]:px-4 [&>th]:py-3">
+                <th className="text-left">Name</th>
+                <th className="text-left">Email</th>
+                <th className="text-left">Role</th>
+                <th className="text-left">Phone</th>
+                <th className="text-left w-12"></th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {filtered.map((u:any) => (
+                <tr key={u.id} className="hover:bg-gray-50">
+                  <td className="px-4 py-3">{u.name || "—"}</td>
+                  <td className="px-4 py-3">{u.email}</td>
+                  <td className="px-4 py-3 capitalize">{u.role || "technician"}</td>
+                  <td className="px-4 py-3">{u.phone || "—"}</td>
+                  <td className="px-2 py-3 text-right">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-8 w-8 text-red-600"
+                      onClick={async ()=>{
+                        if (!confirm("Delete this member?")) return;
+                        await membersApi.remove(u.id);
+                        qc.invalidateQueries({ queryKey: ["/api/members"] });
+                      }}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  </td>
+                </tr>
+              ))}
+              {filtered.length === 0 && (
+                <tr><td colSpan={5} className="px-4 py-10 text-center text-sm text-gray-500">No members</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <AddMemberModal open={open} onOpenChange={setOpen} onSaved={() => qc.invalidateQueries({ queryKey: ["/api/members"] })} />
+    </div>
+  );
+}
+
+function AddMemberModal({
+  open, onOpenChange, onSaved
+}: { open:boolean; onOpenChange:(v:boolean)=>void; onSaved:()=>void; }) {
+  const [email, setEmail] = useState("");
+  const [name, setName] = useState("");
+  const [role, setRole] = useState<string>("technician");
+  const [phone, setPhone] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string|null>(null);
+
+  async function save() {
+    setSaving(true); setErr(null);
+    try {
+      await membersApi.create({ email, name, role, phone });
+      onOpenChange(false);
+      onSaved();
+      setEmail(""); setName(""); setRole("technician"); setPhone("");
+    } catch (e:any) {
+      setErr(e.message || "Failed to add member");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-md">
+        <DialogHeader><DialogTitle>Add Member</DialogTitle></DialogHeader>
+        {err && <div className="text-sm text-red-600">{err}</div>}
+        <div className="grid grid-cols-1 gap-3">
+          <div>
+            <Label>Email</Label>
+            <Input value={email} onChange={(e)=>setEmail(e.target.value)} placeholder="brad@company.com" />
+          </div>
+          <div>
+            <Label>Name</Label>
+            <Input value={name} onChange={(e)=>setName(e.target.value)} placeholder="Brad Smith" />
+          </div>
+          <div>
+            <Label>Role</Label>
+            <Select value={role} onValueChange={(v)=>setRole(v)}>
+              <SelectTrigger className="w-full">
+                <SelectValue placeholder="Select role" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="technician">Technician</SelectItem>
+                <SelectItem value="manager">Manager</SelectItem>
+                <SelectItem value="admin">Admin</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <div>
+            <Label>Phone</Label>
+            <Input value={phone} onChange={(e)=>setPhone(e.target.value)} placeholder="+61…" />
+          </div>
+        </div>
+        <div className="pt-3 flex justify-end gap-2">
+          <Button variant="outline" onClick={()=>onOpenChange(false)} disabled={saving}>Cancel</Button>
+          <Button onClick={save} disabled={saving || !email}>{saving ? "Saving…" : "Add member"}</Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+6) Add the route to your client app (so the page is reachable)
+
+Edit: client/src/App.tsx
+
+import MembersPage from "@/pages/members";
+// ...
+<Route path="/members" component={MembersPage} />
+
+7) (Optional) Add “Members” to the sidebar nav
+
+Edit: client/src/components/layout/sidebar.tsx
+
+Import an icon:
+
+import { UserPlus } from "lucide-react";
+
+
+Add this to navigationItems (e.g., after Teams):
+
+{ path: "/members", label: "Members", icon: UserPlus },
+
+8) Restart the app and test
+
+Go to /members → Add Member (role dropdown).
+
+Try adding the same email again with a different role → should update, not duplicate.
+
+Delete a member → row disappears (no refresh needed).
+
+If you want the Add Member modal to also add straight into a Team, I can drop that variant too. For now, this gets you a clean, working members flow with the right role options and no DB errors.
+
+You said:
+man, my bad. I want replit to do it all so can i have a replit ready do this, code
+ChatGPT said:
+Thought for 30s
+
+You got it. Here’s a single Replit-ready prompt that will:
+
+ensure the DB has users.email, users.role, users.org_id (no shell, done on server start)
+
+add a Members API (list/create/delete, role guard, upsert-by-email)
+
+add client API + Members page with Role dropdown
+
+wire the route (and a sidebar link)
+
+Copy–paste this into Replit Agent:
+
+✅ Replit Agent: Implement “Members” (DB ensure + API + UI)
+
+Do all of the following exactly:
+
+1) Server: add DB ensure on startup (no shell)
+
+Create file: server/db/ensure.ts
+
+import { db } from "./client";
+import { sql } from "drizzle-orm";
+
+/** Idempotent shape guard for users table */
+export async function ensureUsersTableShape() {
+  await db.execute(sql`
+    alter table users
+      add column if not exists email text,
+      add column if not exists role text,
+      add column if not exists org_id uuid
+  `);
+
+  await db.execute(sql`
+    create unique index if not exists users_org_email_unique
+      on users (org_id, lower(email))
+  `);
+
+  await db.execute(sql`
+    create index if not exists users_org_idx on users(org_id)
+  `);
+}
+
+/** Call all ensure-* here */
+export async function ensureDbShape() {
+  await ensureUsersTableShape();
+}
+
+
+Edit file: server/index.ts
+Import and call ensureDbShape() before mounting routes:
+
+// at top with other imports
+import { ensureDbShape } from "./db/ensure";
+
+// inside your main IIFE, right at the beginning:
+(async () => {
+  await ensureDbShape();
+  const server = await registerRoutes(app);
+  // ... (rest of your file unchanged)
+
+2) Server: Members router
+
+Create file: server/routes/members.ts
+
+import { Router } from "express";
+import { db } from "../db/client";
+import { sql } from "drizzle-orm";
+import { requireAuth } from "../middleware/auth";
+import { requireOrg } from "../middleware/tenancy";
+
+const isUuid = (v?: string) => !!v && /^[0-9a-f-]{36}$/i.test(v);
+const allowedRoles = new Set(["technician", "manager", "admin"]);
+
+const members = Router();
+
+/** List org members */
+members.get("/", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  const r: any = await db.execute(sql`
+    select id, email, name, role, phone, avatar_url, created_at
+    from users
+    where org_id=${orgId}::uuid
+    order by created_at desc
+  `);
+  res.json(r.rows);
+});
+
+/** Create/Upsert org member by (org_id, lower(email)) with role guard */
+members.post("/", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  let { email, name, role, phone } = req.body || {};
+  if (!email) return res.status(400).json({ error: "email required" });
+
+  email = String(email).trim();
+  const emailLC = email.toLowerCase();
+  const roleNorm = allowedRoles.has(String(role)) ? String(role) : "technician";
+
+  const existing: any = await db.execute(sql`
+    select id from users where org_id=${orgId}::uuid and lower(email)=${emailLC}
+  `);
+
+  if (existing.rows?.[0]?.id) {
+    const id = existing.rows[0].id;
+    await db.execute(sql`
+      update users set
+        name  = coalesce(${name}, name),
+        role  = ${roleNorm},
+        phone = coalesce(${phone}, phone),
+        email = ${email}
+      where id=${id}::uuid
+    `);
+    return res.json({ ok: true, id, created: false });
+  }
+
+  const ins: any = await db.execute(sql`
+    insert into users (org_id, email, name, role, phone)
+    values (${orgId}::uuid, ${email}, ${name || null}, ${roleNorm}, ${phone || null})
+    returning id
+  `);
+  res.json({ ok: true, id: ins.rows[0].id, created: true });
+});
+
+/** Delete member (scoped to org). Removes team links first. */
+members.delete("/:userId", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  const { userId } = req.params;
+  if (!isUuid(userId)) return res.status(400).json({ error: "invalid userId" });
+
+  await db.execute(sql`delete from team_members where user_id=${userId}::uuid`);
+  await db.execute(sql`delete from users where id=${userId}::uuid and org_id=${orgId}::uuid`);
+  res.json({ ok: true });
+});
+
+export default members;
+
+
+Mount it where routers are registered:
+
+If you have server/routes.ts that does the mounting, add:
+
+import members from "./routes/members";
+app.use("/api/members", members);
+
+
+If you mount directly in server/index.ts, add after registerRoutes(app) (or inside it if appropriate):
+
+import members from "./routes/members";
+app.use("/api/members", members);
+
+3) Client: API helpers
+
+Edit file: client/src/lib/api.ts
+Add this export (keep existing exports):
+
+export const membersApi = {
+  getAll: () => api("/api/members"),
+  create: (body: any) => api("/api/members", { method: "POST", body: JSON.stringify(body) }),
+  remove: (userId: string) => api(`/api/members/${userId}`, { method: "DELETE" }),
+};
+
+4) Client: Members page (with Role dropdown)
+
+Create file: client/src/pages/members.tsx
+
+import { useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { membersApi } from "@/lib/api";
+import { Card, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Label } from "@/components/ui/label";
+import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "@/components/ui/select";
+import { Trash2 } from "lucide-react";
+
+export default function MembersPage() {
+  const qc = useQueryClient();
+  const { data: list = [], isLoading } = useQuery({ queryKey: ["/api/members"], queryFn: membersApi.getAll });
+  const [q, setQ] = useState("");
+  const [open, setOpen] = useState(false);
+
+  const filtered = (list as any[]).filter((u) =>
+    [u.name, u.email, u.role, u.phone].join(" ").toLowerCase().includes(q.toLowerCase())
+  );
+
+  return (
+    <div className="p-6 space-y-4">
+      <div className="flex items-center justify-between gap-2">
+        <h1 className="text-2xl font-bold">Team Members</h1>
+        <div className="flex gap-2">
+          <Input className="w-64" placeholder="Search name, email, role…" value={q} onChange={(e)=>setQ(e.target.value)} />
+          <Button onClick={()=>setOpen(true)}>Add Member</Button>
+        </div>
+      </div>
+
+      {isLoading ? (
+        <Card><CardContent className="py-10 text-center text-sm text-gray-500">Loading…</CardContent></Card>
+      ) : (
+        <div className="overflow-x-auto rounded-xl border border-gray-200 bg-white">
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50 text-gray-600 text-xs uppercase">
+              <tr className="[&>th]:px-4 [&>th]:py-3">
+                <th className="text-left">Name</th>
+                <th className="text-left">Email</th>
+                <th className="text-left">Role</th>
+                <th className="text-left">Phone</th>
+                <th className="text-left w-12"></th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {filtered.map((u:any) => (
+                <tr key={u.id} className="hover:bg-gray-50">
+                  <td className="px-4 py-3">{u.name || "—"}</td>
+                  <td className="px-4 py-3">{u.email}</td>
+                  <td className="px-4 py-3 capitalize">{u.role || "technician"}</td>
+                  <td className="px-4 py-3">{u.phone || "—"}</td>
+                  <td className="px-2 py-3 text-right">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-8 w-8 text-red-600"
+                      onClick={async ()=>{
+                        if (!confirm("Delete this member?")) return;
+                        await membersApi.remove(u.id);
+                        qc.invalidateQueries({ queryKey: ["/api/members"] });
+                      }}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  </td>
+                </tr>
+              ))}
+              {filtered.length === 0 && (
+                <tr><td colSpan={5} className="px-4 py-10 text-center text-sm text-gray-500">No members</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <AddMemberModal open={open} onOpenChange={setOpen} onSaved={() => qc.invalidateQueries({ queryKey: ["/api/members"] })} />
+    </div>
+  );
+}
+
+function AddMemberModal({
+  open, onOpenChange, onSaved
+}: { open:boolean; onOpenChange:(v:boolean)=>void; onSaved:()=>void; }) {
+  const [email, setEmail] = useState("");
+  const [name, setName] = useState("");
+  const [role, setRole] = useState<string>("technician");
+  const [phone, setPhone] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string|null>(null);
+
+  async function save() {
+    setSaving(true); setErr(null);
+    try {
+      await membersApi.create({ email, name, role, phone });
+      onOpenChange(false);
+      onSaved();
+      setEmail(""); setName(""); setRole("technician"); setPhone("");
+    } catch (e:any) {
+      setErr(e.message || "Failed to add member");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-md">
+        <DialogHeader><DialogTitle>Add Member</DialogTitle></DialogHeader>
+        {err && <div className="text-sm text-red-600">{err}</div>}
+        <div className="grid grid-cols-1 gap-3">
+          <div>
+            <Label>Email</Label>
+            <Input value={email} onChange={(e)=>setEmail(e.target.value)} placeholder="brad@company.com" />
+          </div>
+          <div>
+            <Label>Name</Label>
+            <Input value={name} onChange={(e)=>setName(e.target.value)} placeholder="Brad Smith" />
+          </div>
+          <div>
+            <Label>Role</Label>
+            <Select value={role} onValueChange={(v)=>setRole(v)}>
+              <SelectTrigger className="w-full">
+                <SelectValue placeholder="Select role" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="technician">Technician</SelectItem>
+                <SelectItem value="manager">Manager</SelectItem>
+                <SelectItem value="admin">Admin</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <div>
+            <Label>Phone</Label>
+            <Input value={phone} onChange={(e)=>setPhone(e.target.value)} placeholder="+61…" />
+          </div>
+        </div>
+        <div className="pt-3 flex justify-end gap-2">
+          <Button variant="outline" onClick={()=>onOpenChange(false)} disabled={saving}>Cancel</Button>
+          <Button onClick={save} disabled={saving || !email}>{saving ? "Saving…" : "Add member"}</Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+5) Client: route + (optional) sidebar link
+
+Edit file: client/src/App.tsx — add the route:
+
+import MembersPage from "@/pages/members";
+// ...
+<Route path="/members" component={MembersPage} />
+
+
+(Optional) Edit file: client/src/components/layout/sidebar.tsx — add a “Members” nav item (use Users icon) under Teams.
+
+6) Verify
+
+Start the app (server calls ensureDbShape() and makes columns/indexes if missing).
+
+Go to /members → Add Member with role dropdown → appears in list, no refresh needed.
+
+Add same email again → updates role/phone (no duplicates).
+
+Delete → row disappears.

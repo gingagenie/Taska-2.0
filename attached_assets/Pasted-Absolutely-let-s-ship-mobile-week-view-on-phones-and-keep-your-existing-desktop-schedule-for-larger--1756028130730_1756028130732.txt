@@ -1,0 +1,186 @@
+Absolutely—let’s ship mobile week view on phones and keep your existing desktop schedule for larger screens. And yes, I’ll make this Replit Agent–ready with copy-paste steps.
+
+
+---
+
+Replit Agent — Responsive Schedule (Mobile week list + Desktop stays)
+
+0) What stays / what’s new
+
+Desktop (/schedule): keep your current schedule page as-is.
+
+Mobile (/schedule): render a vertical week list (Mon→Sun) with sticky day headers.
+
+Routing: one route (/schedule) that chooses mobile or desktop at runtime.
+
+
+
+---
+
+1) Add mobile detector hook
+
+Create: client/src/hooks/use-is-mobile.ts
+
+import { useEffect, useState } from "react";
+
+/** Returns true on small screens (≤768px). Uses resize + SSR safety. */
+export function useIsMobile(breakpoint = 768) {
+  const [isMobile, setIsMobile] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false;
+    return window.innerWidth <= breakpoint;
+  });
+
+  useEffect(() => {
+    function onResize() {
+      setIsMobile(window.innerWidth <= breakpoint);
+    }
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [breakpoint]);
+
+  return isMobile;
+}
+
+
+---
+
+2) Add the mobile week schedule page
+
+Create: client/src/pages/schedule-week-mobile.tsx
+(Use the exact component I sent previously — it groups jobs Mon→Sun with sticky headers and links to job cards.)
+
+> If it’s not already added, paste that whole file in now.
+
+
+
+
+---
+
+3) Wrap both views with a responsive router
+
+Create: client/src/pages/schedule-responsive.tsx
+
+import { useIsMobile } from "@/hooks/use-is-mobile";
+import ScheduleWeekMobile from "@/pages/schedule-week-mobile";
+import DesktopSchedule from "@/pages/schedule"; // your existing desktop page
+
+export default function ScheduleResponsive() {
+  const isMobile = useIsMobile();
+  return isMobile ? <ScheduleWeekMobile /> : <DesktopSchedule />;
+}
+
+> If your desktop component file is named differently, adjust the import.
+
+
+
+
+---
+
+4) Route /schedule to the wrapper
+
+Edit: client/src/App.tsx
+Replace your old /schedule route with:
+
+import ScheduleResponsive from "@/pages/schedule-responsive";
+
+// …
+<Route path="/schedule" component={ScheduleResponsive} />
+
+
+---
+
+5) API (only if not added yet)
+
+If you haven’t already added the range endpoint & client wrapper:
+
+Server: server/routes/schedule.ts
+
+import { Router } from "express";
+import { db } from "../db/client";
+import { sql } from "drizzle-orm";
+import { requireAuth } from "../middleware/auth";
+import { requireOrg } from "../middleware/tenancy";
+
+export const schedule = Router();
+
+schedule.get("/range", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  const { start, end, techId } = req.query as Record<string, string | undefined>;
+  if (!start || !end) return res.status(400).json({ error: "start and end required (YYYY-MM-DD)" });
+
+  const techFilter = techId ? sql`
+    and exists (
+      select 1 from job_assignments ja
+      where ja.job_id=j.id and ja.user_id=${techId}::uuid
+    )
+  ` : sql``;
+
+  const r: any = await db.execute(sql`
+    select
+      j.id, j.title, j.description, j.status, j.scheduled_at,
+      j.customer_id, coalesce(c.name,'—') as customer_name,
+      (select json_agg(json_build_object('id', u.id, 'name', u.name) order by u.name)
+         from job_assignments ja
+         join users u on u.id = ja.user_id
+        where ja.job_id = j.id
+      ) as technicians
+    from jobs j
+    left join customers c on c.id = j.customer_id
+    where j.org_id=${orgId}::uuid
+      and j.scheduled_at >= ${start}::date
+      and j.scheduled_at <  ${end}::date
+      ${techFilter}
+    order by j.scheduled_at asc nulls last, j.created_at desc
+  `);
+
+  res.json(r.rows);
+});
+
+Mount: in your server bootstrap:
+
+import { schedule } from "./routes/schedule";
+app.use("/api/schedule", schedule);
+
+Client API wrapper: client/src/lib/api.ts
+
+export const scheduleApi = {
+  range: (p: { start: string; end: string; techId?: string }) => {
+    const q = new URLSearchParams(p as any).toString();
+    return api(`/api/schedule/range?${q}`);
+  },
+};
+
+
+---
+
+6) Meta viewport for proper mobile height (if missing)
+
+Edit: client/index.html (or index.html)
+
+<meta name="viewport"
+  content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+
+
+---
+
+7) Optional polish
+
+Add a tab toggle at the top of the desktop schedule to link to /schedule (it renders desktop automatically on big screens; mobile users will see the mobile layout).
+
+In the mobile page, wire the tech filter to your real members list (teams API).
+
+
+
+---
+
+Done / How to test
+
+On desktop/laptop: /schedule shows your existing schedule.
+
+On phone or narrow window (≤768px): /schedule shows the vertical week (Mon→Sun) with sticky headers.
+
+Tapping a job opens the job card as before.
+
+
+If you want the breakpoint higher/lower, tweak useIsMobile(…) arg in the wrapper.
+

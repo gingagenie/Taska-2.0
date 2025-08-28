@@ -1,0 +1,325 @@
+0) DB assumptions (no shell)
+
+users table has: id uuid, org_id uuid, email text unique, name text, role text, phone text, avatar_url text, created_at timestamptz
+
+teams, team_members(team_id,user_id) exist (from earlier scaffold)
+
+If users.org_id didn’t exist, add it previously (we’ve been using it already via requireOrg).
+
+1) Server — server/routes/members.ts (NEW)
+
+Create a new router for org members; also keep a compat shim for your legacy “add-member to team” endpoint.
+
+// server/routes/members.ts
+import { Router } from "express";
+import { db } from "../db/client";
+import { sql } from "drizzle-orm";
+import { requireAuth } from "../middleware/auth";
+import { requireOrg } from "../middleware/tenancy";
+
+const isUuid = (v?: string) => !!v && /^[0-9a-f-]{36}$/i.test(v);
+export const members = Router();
+
+/** List org members */
+members.get("/", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  const r: any = await db.execute(sql`
+    select id, email, name, role, phone, avatar_url, created_at
+    from users
+    where org_id=${orgId}::uuid
+    order by created_at desc
+  `);
+  res.json(r.rows);
+});
+
+/** Create org member (upsert by email within org) */
+members.post("/", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  const { email, name, role, phone } = req.body || {};
+  if (!email) return res.status(400).json({ error: "email required" });
+
+  // try find existing user in this org
+  const existing: any = await db.execute(sql`
+    select id from users where org_id=${orgId}::uuid and lower(email)=lower(${email})
+  `);
+  if (existing.rows?.[0]?.id) {
+    // update name/role/phone if provided
+    await db.execute(sql`
+      update users set
+        name = coalesce(${name}, name),
+        role = coalesce(${role}, role),
+        phone = coalesce(${phone}, phone)
+      where id=${existing.rows[0].id}::uuid
+    `);
+    return res.json({ ok: true, id: existing.rows[0].id, created: false });
+  }
+
+  const ins: any = await db.execute(sql`
+    insert into users (org_id, email, name, role, phone)
+    values (${orgId}::uuid, ${email}, ${name || null}, ${role || null}, ${phone || null})
+    returning id
+  `);
+  res.json({ ok: true, id: ins.rows[0].id, created: true });
+});
+
+/** Delete member (only within same org, and safe if team links exist) */
+members.delete("/:userId", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  const { userId } = req.params;
+  if (!isUuid(userId)) return res.status(400).json({ error: "invalid userId" });
+
+  // Optional: prevent self-delete; comment out if you want to allow
+  // if ((req as any).user.id === userId) return res.status(400).json({ error: "cannot delete yourself" });
+
+  // Remove from team_members first
+  await db.execute(sql`delete from team_members where user_id=${userId}::uuid`);
+  // Delete user (scoped to org)
+  await db.execute(sql`delete from users where id=${userId}::uuid and org_id=${orgId}::uuid`);
+  res.json({ ok: true });
+});
+
+/** COMPAT: legacy endpoint you used earlier: POST /api/teams/add-member
+ * Accepts { email, name, teamId }. Creates/finds user in org, then adds to team_members.
+ */
+members.post("/_compat/teams-add-member", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  let { email, name, teamId, role, phone } = req.body || {};
+  if (!email) return res.status(400).json({ error: "email required" });
+  if (!isUuid(teamId)) return res.status(400).json({ error: "invalid teamId" });
+
+  const existing: any = await db.execute(sql`
+    select id from users where org_id=${orgId}::uuid and lower(email)=lower(${email})
+  `);
+  let userId: string;
+
+  if (existing.rows?.[0]?.id) {
+    userId = existing.rows[0].id;
+    await db.execute(sql`
+      update users set
+        name = coalesce(${name}, name),
+        role = coalesce(${role}, role),
+        phone = coalesce(${phone}, phone)
+      where id=${userId}::uuid
+    `);
+  } else {
+    const ins: any = await db.execute(sql`
+      insert into users (org_id, email, name, role, phone)
+      values (${orgId}::uuid, ${email}, ${name || null}, ${role || null}, ${phone || null})
+      returning id
+    `);
+    userId = ins.rows[0].id;
+  }
+
+  await db.execute(sql`
+    insert into team_members (team_id, user_id)
+    values (${teamId}::uuid, ${userId}::uuid)
+    on conflict do nothing
+  `);
+
+  res.json({ ok: true, userId });
+});
+
+export default members;
+
+
+Mount it in your routes registration (where other routers are mounted):
+
+// server/routes.ts (or server/index.ts where you register routers)
+import members from "./routes/members";
+app.use("/api/members", members);
+
+// Keep your existing teams route mounting as-is.
+// Also (optionally) expose the compat endpoint at exactly /api/teams/add-member:
+app.post("/api/teams/add-member", members); // will dispatch to members router (POST only)
+// If your router mounting doesn't support that, you can instead:
+// app.post("/api/teams/add-member", (req,res,next) => members.handle(req,res,next));
+
+
+(If that app.post("/api/teams/add-member", members); pattern doesn’t fit your setup, just change your client to call /api/members/_compat/teams-add-member.)
+
+2) Client API — add Members helpers
+
+File: client/src/lib/api.ts
+Add:
+
+export const membersApi = {
+  getAll: () => api("/api/members"),
+  create: (body: any) => api("/api/members", { method: "POST", body: JSON.stringify(body) }),
+  remove: (userId: string) => api(`/api/members/${userId}`, { method: "DELETE" }),
+
+  // legacy compatibility so existing flows keep working
+  addToTeamCompat: (body: { email: string; name?: string; teamId: string; role?: string; phone?: string; }) =>
+    api("/api/members/_compat/teams-add-member", { method: "POST", body: JSON.stringify(body) }),
+};
+
+
+(Keep your existing teamsApi.addMember if you’d like, but point it to membersApi.addToTeamCompat under the hood to reduce duplication.)
+
+3) UI — simple Members page + “Add Member” modal
+
+A) Add a page: client/src/pages/members.tsx
+
+import { useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { membersApi } from "@/lib/api";
+import { Card, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Label } from "@/components/ui/label";
+import { Trash2 } from "lucide-react";
+
+export default function MembersPage() {
+  const qc = useQueryClient();
+  const { data: list = [], isLoading } = useQuery({ queryKey: ["/api/members"], queryFn: membersApi.getAll });
+  const [q, setQ] = useState("");
+  const [open, setOpen] = useState(false);
+
+  const filtered = (list as any[]).filter((u) =>
+    [u.name, u.email, u.role, u.phone].join(" ").toLowerCase().includes(q.toLowerCase())
+  );
+
+  return (
+    <div className="p-6 space-y-4">
+      <div className="flex items-center justify-between gap-2">
+        <h1 className="text-2xl font-bold">Team Members</h1>
+        <div className="flex gap-2">
+          <Input className="w-64" placeholder="Search name, email, role…" value={q} onChange={(e)=>setQ(e.target.value)} />
+          <Button onClick={()=>setOpen(true)}>Add Member</Button>
+        </div>
+      </div>
+
+      {isLoading ? (
+        <Card><CardContent className="py-10 text-center text-sm text-gray-500">Loading…</CardContent></Card>
+      ) : (
+        <div className="overflow-x-auto rounded-xl border border-gray-200 bg-white">
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50 text-gray-600 text-xs uppercase">
+              <tr className="[&>th]:px-4 [&>th]:py-3">
+                <th className="text-left">Name</th>
+                <th className="text-left">Email</th>
+                <th className="text-left">Role</th>
+                <th className="text-left">Phone</th>
+                <th className="text-left w-12"></th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {filtered.map((u:any) => (
+                <tr key={u.id} className="hover:bg-gray-50">
+                  <td className="px-4 py-3">{u.name || "—"}</td>
+                  <td className="px-4 py-3">{u.email}</td>
+                  <td className="px-4 py-3">{u.role || "—"}</td>
+                  <td className="px-4 py-3">{u.phone || "—"}</td>
+                  <td className="px-2 py-3 text-right">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-8 w-8 text-red-600"
+                      onClick={async ()=>{
+                        if (!confirm("Delete this member?")) return;
+                        await membersApi.remove(u.id);
+                        qc.invalidateQueries({ queryKey: ["/api/members"] });
+                      }}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  </td>
+                </tr>
+              ))}
+              {filtered.length === 0 && (
+                <tr><td colSpan={5} className="px-4 py-10 text-center text-sm text-gray-500">No members</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <AddMemberModal open={open} onOpenChange={setOpen} onSaved={() => qc.invalidateQueries({ queryKey: ["/api/members"] })} />
+    </div>
+  );
+}
+
+function AddMemberModal({ open, onOpenChange, onSaved }: { open:boolean; onOpenChange:(v:boolean)=>void; onSaved:()=>void; }) {
+  const [email, setEmail] = useState("");
+  const [name, setName] = useState("");
+  const [role, setRole] = useState("");
+  const [phone, setPhone] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string|null>(null);
+
+  async function save() {
+    setSaving(true); setErr(null);
+    try {
+      await membersApi.create({ email, name, role, phone });
+      onOpenChange(false);
+      onSaved();
+      setEmail(""); setName(""); setRole(""); setPhone("");
+    } catch (e:any) {
+      setErr(e.message || "Failed to add member");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-md">
+        <DialogHeader><DialogTitle>Add Member</DialogTitle></DialogHeader>
+        {err && <div className="text-sm text-red-600">{err}</div>}
+        <div className="grid grid-cols-1 gap-3">
+          <div>
+            <Label>Email</Label>
+            <Input value={email} onChange={(e)=>setEmail(e.target.value)} placeholder="brad@company.com" />
+          </div>
+          <div>
+            <Label>Name</Label>
+            <Input value={name} onChange={(e)=>setName(e.target.value)} placeholder="Brad Smith" />
+          </div>
+          <div>
+            <Label>Role</Label>
+            <Input value={role} onChange={(e)=>setRole(e.target.value)} placeholder="Technician" />
+          </div>
+          <div>
+            <Label>Phone</Label>
+            <Input value={phone} onChange={(e)=>setPhone(e.target.value)} placeholder="+61…" />
+          </div>
+        </div>
+        <div className="pt-3 flex justify-end gap-2">
+          <Button variant="outline" onClick={()=>onOpenChange(false)} disabled={saving}>Cancel</Button>
+          <Button onClick={save} disabled={saving || !email}>{saving ? "Saving…" : "Add member"}</Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+
+Hook route in your app (e.g., client/src/App.tsx):
+
+import MembersPage from "@/pages/members";
+<Route path="/members" component={MembersPage} />
+
+
+Optional: add “Members” to the sidebar.
+
+4) (Optional) Add-to-Team (same modal)
+
+If you want the modal to also drop the new member straight into a specific team:
+
+Fetch teams list and add a <select> for Team (optional).
+
+On save:
+
+const r = await membersApi.create({ email, name, role, phone })
+
+if teamId chosen → await membersApi.addToTeamCompat({ email, name, teamId, role, phone })
+
+Want me to paste that variant too? Say the word and I’ll drop it in.
+
+5) Smoke test
+
+Go to /members → Add Member → appears in list instantly (no refresh).
+
+Delete a member → row disappears.
+
+(Compat) Hitting POST /api/teams/add-member still works (creates/updates user and links to team).

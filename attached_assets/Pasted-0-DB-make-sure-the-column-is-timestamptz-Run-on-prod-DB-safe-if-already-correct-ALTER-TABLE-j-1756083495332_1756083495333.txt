@@ -1,0 +1,194 @@
+0) DB: make sure the column is timestamptz
+
+Run on prod DB (safe if already correct):
+
+ALTER TABLE jobs
+  ALTER COLUMN scheduled_at TYPE timestamptz
+  USING CASE
+         WHEN scheduled_at::text ~ 'Z$' THEN scheduled_at::timestamptz
+         ELSE (scheduled_at AT TIME ZONE 'Australia/Melbourne')
+       END;
+
+
+If it’s already timestamptz, Postgres will accept the TYPE without change.
+
+1) Client: always send UTC ISO (with Z) from mobile & desktop
+a) Helper to format for <input type="datetime-local"> and back
+
+Create: client/src/lib/datetime.ts
+
+export function localInputFromISO(iso?: string) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+// Takes value from <input type="datetime-local"> (local time) -> UTC ISO
+export function isoFromLocalInput(local?: string) {
+  if (!local) return null;
+  // new Date(local) treats it as local time; toISOString() converts to UTC Z
+  const d = new Date(local);
+  return isNaN(d.valueOf()) ? null : d.toISOString();
+}
+
+b) New Job / Edit Job pages: use the helpers
+
+Edit: job create modal/page and job-edit page where you manage scheduledAt
+
+When loading an existing job:
+
+import { localInputFromISO, isoFromLocalInput } from "@/lib/datetime";
+// ...
+setScheduledAt(localInputFromISO(j.scheduled_at));
+
+
+On save:
+
+await api(`/api/jobs/${jobId}`, {
+  method: "PUT",
+  body: JSON.stringify({
+    title, description, status,
+    scheduledAt: isoFromLocalInput(scheduledAt), // <-- send UTC ISO with Z
+    customerId: customerId || null,
+  }),
+});
+
+
+For new job:
+
+await jobsApi.create({
+  title, description,
+  scheduledAt: isoFromLocalInput(scheduledAt), // same conversion
+  customerId: customerId || null,
+  assignedTechIds,
+});
+
+
+Your input stays:
+
+<input
+  type="datetime-local"
+  value={scheduledAt}
+  onChange={(e) => setScheduledAt(e.target.value)}
+/>
+
+2) Server: timezone-aware schedule range (mobile friendly)
+
+Edit: server/routes/schedule.ts
+
+const BIZ_TZ = process.env.BIZ_TZ || "Australia/Melbourne";
+
+schedule.get("/range", requireAuth, requireOrg, async (req, res) => {
+  const orgId = (req as any).orgId;
+  const { start, end, techId, tz } = req.query as Record<string, string|undefined>;
+  if (!start || !end) return res.status(400).json({ error: "start and end required (YYYY-MM-DD)" });
+
+  const zone = tz || BIZ_TZ;
+
+  const techFilter = techId ? sql`
+    and exists (
+      select 1 from job_assignments ja
+      where ja.job_id = j.id and ja.user_id = ${techId}::uuid
+    )
+  ` : sql``;
+
+  const r: any = await db.execute(sql`
+    select
+      j.id, j.title, j.description, j.status, j.scheduled_at,
+      j.customer_id, coalesce(c.name,'—') as customer_name,
+      (
+        select json_agg(json_build_object('id', u.id, 'name', u.name) order by u.name)
+        from job_assignments ja
+        join users u on u.id = ja.user_id
+        where ja.job_id = j.id
+      ) as technicians
+    from jobs j
+    left join customers c on c.id = j.customer_id
+    where j.org_id = ${orgId}::uuid
+      and ((j.scheduled_at at time zone ${sql.raw(`'${zone}'`)})::date >= ${start}::date)
+      and ((j.scheduled_at at time zone ${sql.raw(`'${zone}'`)})::date <  ${end}::date)
+      ${techFilter}
+    order by j.scheduled_at asc nulls last, j.created_at desc
+  `);
+
+  res.json(r.rows);
+});
+
+
+Mobile caller: pass tz=Australia/Melbourne:
+
+scheduleApi.range({ start, end, tz: "Australia/Melbourne" });
+
+3) Server: accept ISO or local strings on write (belt & braces)
+
+Edit: server/routes/jobs.ts (create & update endpoints)
+
+function normalizeScheduledAt(raw: any): string|null {
+  if (!raw) return null;
+  // If client already sent ISO with Z, pass it through
+  if (typeof raw === "string" && /Z$/.test(raw)) return raw;
+  // If it looks like "YYYY-MM-DDTHH:mm" (datetime-local), treat as local AEST and convert to UTC
+  if (typeof raw === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(raw)) {
+    const d = new Date(raw); // local
+    if (!isNaN(d.valueOf())) return d.toISOString();
+  }
+  // Fallback: let Postgres parse; but ensure timestamptz column
+  return raw;
+}
+
+// in POST /create and PUT /:jobId use:
+const scheduled = normalizeScheduledAt(scheduledAt);
+...
+values (..., ${scheduled || null}, ...)
+
+...
+scheduled_at = coalesce(${scheduled}, scheduled_at),
+
+4) Add a tiny time debug endpoint (so you can see what’s happening)
+
+Create: server/routes/debug.ts (or extend if you already have it)
+
+debugRouter.get("/time", async (req, res) => {
+  const tz = (req.query.tz as string) || process.env.BIZ_TZ || "Australia/Melbourne";
+  const sample = (req.query.ts as string) || null; // ISO string or omit
+
+  const r: any = await db.execute(sql`
+    select
+      now() as db_now_utc,
+      current_setting('TimeZone') as db_timezone,
+      ${tz} as biz_tz,
+      ${sample}::timestamptz as sample_in_db,
+      (${sample}::timestamptz at time zone ${sql.raw(`'${tz}'`)}) as sample_in_${sql.raw(tz.replace('/','_'))}
+  `);
+  res.json({
+    server_now_utc: new Date().toISOString(),
+    db: r.rows?.[0] || null,
+  });
+});
+
+
+Then on your phone:
+
+Visit https://taska.info/api/debug/time?tz=Australia/Melbourne
+
+Paste a job’s scheduled_at like:
+https://taska.info/api/debug/time?tz=Australia/Melbourne&ts=2025-08-26T02:30:00Z
+You’ll see exactly how the DB interprets it.
+
+Quick test script (do this once)
+
+On mobile create a job at, say, 10:00 AEST using the new UI (the input shows local).
+
+Confirm the server received UTC ISO (check the job JSON; scheduled_at ends with Z).
+
+Hit the schedule for today on mobile (with tz):
+/api/schedule/range?start=2025-08-26&end=2025-08-27&tz=Australia/Melbourne
+The job should be in that list.
+
+If it’s still missing, send me:
+
+that job’s scheduled_at (ISO), and
+
+the JSON from /api/debug/time?tz=Australia/Melbourne&ts=<that ISO>
+
+…and I’ll pinpoint the boundary issue (down to the minute).

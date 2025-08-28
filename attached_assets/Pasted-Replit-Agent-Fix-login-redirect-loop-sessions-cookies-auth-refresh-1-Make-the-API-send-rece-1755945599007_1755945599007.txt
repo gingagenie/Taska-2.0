@@ -1,0 +1,121 @@
+Replit Agent — Fix login redirect loop (sessions + cookies + auth refresh)
+1) Make the API send/receive cookies
+
+Edit: client/src/lib/api.ts
+
+Add credentials: "include" to every request:
+
+const res = await fetch(`${BASE}${path}`, {
+  ...init,
+  headers,
+  credentials: "include",   // <-- important
+});
+
+2) Harden session cookies for Replit proxy
+
+Edit: server/index.ts (where you set up express-session)
+
+Trust the proxy.
+
+Use cookie flags that work in both dev and deployed.
+
+If your client and API are on different origins, you’ll need sameSite: "none" and secure: true in production.
+
+import session from "express-session";
+import pgSession from "connect-pg-simple";
+import { Pool } from "pg";
+
+app.set("trust proxy", 1); // <-- behind Replit/Janeway proxy
+
+const PgStore = pgSession(session as any);
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+const isProd = process.env.NODE_ENV === "production";
+
+app.use(
+  session({
+    store: new PgStore({ pool, tableName: "session" }),
+    secret: process.env.SESSION_SECRET || "dev-secret-change-me",
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      // If your frontend hits a different origin (custom domain, separate client host),
+      // you need sameSite:'none' + secure:true in prod:
+      sameSite: isProd ? "none" : "lax",
+      secure: isProd ? true : false,
+      maxAge: 1000 * 60 * 60 * 24 * 30,
+    },
+  })
+);
+
+3) (Only if API and client are on different origins) Enable CORS with credentials
+
+If your VITE_API_BASE_URL is a different origin (custom domain or separate Replit URL), add:
+
+Install: cors (you already have it).
+Edit: server/index.ts before routes:
+
+import cors from "cors";
+
+const origin = process.env.CLIENT_ORIGIN || true; 
+// set CLIENT_ORIGIN to your client URL if needed, else 'true' for reflect
+
+app.use(cors({
+  origin,              // e.g., "https://YOUR-CLIENT.replit.dev"
+  credentials: true,   // allow cookies
+}));
+
+
+(If client and API are same origin, you can skip CORS.)
+
+4) Make auth context actually refresh after login
+
+After POST /api/auth/login, the cookie is set, but your UI might still show Landing because /api/me hasn’t been re-fetched. Two easy fixes; do both:
+
+A) In the login page, after a successful login, call a “refresh me” endpoint or just force-fetch /api/me before navigate("/").
+
+B) In your useAuth() provider, expose a reload() that re-fetches the user.
+
+Edit: client/src/context/auth-context.tsx (names may vary)
+
+const [user, setUser] = useState<any>(null);
+
+async function fetchMe() {
+  try { setUser(await api("/api/me")); }
+  catch { setUser(null); }
+}
+
+useEffect(()=>{ fetchMe(); }, []);
+
+const value = { user, reload: fetchMe };
+
+
+Edit: client/src/pages/auth-login.tsx (after successful login)
+
+import { useAuth } from "@/hooks/use-auth";
+// ...
+const { reload } = useAuth();
+// ...
+await api("/api/auth/login", { method:"POST", body: JSON.stringify({ email, password }) });
+await reload();       // <-- ensure user is set from session cookie
+nav("/");
+
+
+Do the same after register.
+
+5) Quick sanity checklist
+
+Open devtools → Network → after calling /api/auth/login, check:
+
+Response has Set-Cookie: connect.sid=...
+
+Subsequent /api/me request sends that cookie (Request Headers → Cookie).
+
+If not, verify:
+
+credentials: "include" is present,
+
+sameSite/secure combo matches your deployment (prod often needs none+secure),
+
+If cross-origin, CORS has credentials:true and correct origin.

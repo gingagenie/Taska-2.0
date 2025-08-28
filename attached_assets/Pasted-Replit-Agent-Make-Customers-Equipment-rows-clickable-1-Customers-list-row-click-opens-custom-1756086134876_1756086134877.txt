@@ -1,0 +1,128 @@
+Replit Agent — Make Customers & Equipment rows clickable
+1) Customers list → row click opens /customers/:id
+
+Edit: client/src/pages/customers.tsx (or wherever the table lives)
+
+import { useLocation } from "wouter";
+// …
+const [, navigate] = useLocation();
+
+<tbody className="bg-white divide-y divide-gray-200">
+  {customers.map((c: any) => (
+    <tr
+      key={c.id}
+      className="hover:bg-gray-50 cursor-pointer"
+      onClick={() => navigate(`/customers/${c.id}`)}
+      role="button"
+      aria-label={`Open ${c.name}`}
+    >
+      <td className="px-6 py-4 whitespace-nowrap">
+        <div className="text-sm font-medium text-gray-900">{c.name}</div>
+        <div className="text-xs text-gray-500">{c.email}</div>
+      </td>
+      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">
+        {c.contact_name || "—"}
+      </td>
+      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">
+        {c.phone || "—"}
+      </td>
+      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">
+        {c.address_line1 ? `${c.address_line1}, ${c.suburb} ${c.state} ${c.postcode}` : "—"}
+      </td>
+      <td
+        className="px-6 py-4 whitespace-nowrap text-right text-sm"
+        onClick={(e) => e.stopPropagation()} // prevent row navigation
+      >
+        {/* keep your existing buttons */}
+        <Button variant="ghost" size="sm" onClick={() => navigate(`/customers/${c.id}/edit`)}>
+          Edit
+        </Button>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="text-red-600"
+          onClick={() => onDeleteCustomer(c.id)} // your existing handler
+        >
+          Delete
+        </Button>
+      </td>
+    </tr>
+  ))}
+</tbody>
+
+
+Note the onClick={(e) => e.stopPropagation()} on the actions cell so Edit/Delete don’t trigger navigation.
+
+2) Equipment list → row click opens /equipment/:id
+
+Edit: client/src/pages/equipment.tsx
+
+import { useLocation } from "wouter";
+// …
+const [, navigate] = useLocation();
+
+<tbody className="bg-white divide-y divide-gray-200">
+  {equipment.map((e: any) => (
+    <tr
+      key={e.id}
+      className="hover:bg-gray-50 cursor-pointer"
+      onClick={() => navigate(`/equipment/${e.id}`)}
+      role="button"
+      aria-label={`Open equipment ${e.name}`}
+    >
+      <td className="px-6 py-4 whitespace-nowrap">
+        <div className="text-sm font-medium text-gray-900">{e.name}</div>
+        <div className="text-xs text-gray-500">{e.serial || "—"}</div>
+      </td>
+      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">
+        {e.make || "—"} {e.model || ""}
+      </td>
+      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">
+        {e.customer_name || "Unassigned"}
+      </td>
+      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">
+        {e.updated_at ? new Date(e.updated_at).toLocaleString() : "—"}
+      </td>
+      <td
+        className="px-6 py-4 whitespace-nowrap text-right text-sm"
+        onClick={(ev) => ev.stopPropagation()}
+      >
+        <Button variant="ghost" size="sm" onClick={() => navigate(`/equipment/${e.id}/edit`)}>
+          Edit
+        </Button>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="text-red-600"
+          onClick={() => onDeleteEquipment(e.id)} // your existing handler
+        >
+          Delete
+        </Button>
+      </td>
+    </tr>
+  ))}
+</tbody>
+
+3) (Optional) Card layout? Make the whole card clickable
+
+If those pages use cards instead of a table, add onClick to the card container and stop propagation on inner action buttons:
+
+<div
+  key={c.id}
+  className="rounded-lg border p-4 hover:bg-gray-50 cursor-pointer"
+  onClick={() => navigate(`/customers/${c.id}`)}
+>
+  {/* …content… */}
+  <div className="mt-3 flex gap-2" onClick={(e) => e.stopPropagation()}>
+    <Button size="sm" onClick={() => navigate(`/customers/${c.id}/edit`)}>Edit</Button>
+    <Button size="sm" variant="destructive" onClick={() => onDeleteCustomer(c.id)}>Delete</Button>
+  </div>
+</div>
+
+4) Nice UX touches (quick)
+
+Add a subtle hint column text: Click for details → (right aligned).
+
+Add title attribute to the <tr> for accessibility: title="Open details".
+
+Keep keyboard users happy by making the name also a <button className="text-left"> with onClick, but the row click already covers most.
